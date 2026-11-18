@@ -1,0 +1,78 @@
+[package]
+name = "account-vault"
+version = "1.0.0"
+description = "Account Vault - Modern Native Universal Password & 2FA Manager"
+authors = ["Account Vault Team"]
+license = "MIT"
+edition = "2024"
+
+[lib]
+name = "account_vault_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = "0.10"
+scrypt = { version = "0.11", default-features = false }
+totp-rs = { version = "5.6", features = ["qr", "serde"] }
+uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+base32 = "0.5"
+dirs = "6.0"
+parking_lot = "0.12"
+thiserror = "2.0"
+hex = "0.4"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = "0.3"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39.1"
+windows = { version = "0.62", features = [
+    "Security_Credentials_UI",
+    "Win32_Security_Cryptography",
+    "Win32_System_WinRT",
+    "Win32_Foundation",
+    "Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Com",
+    "Win32_UI_Shell"
+] }
+windows-future = "0.3"
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-biometric = "2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+[profile.dev.package.scrypt]
+opt-level = 3
+
+[profile.dev.package.aes-gcm]
+opt-level = 3
+
+[profile.dev.package.salsa20]
+opt-level = 3
+
+[profile.dev.package.pbkdf2]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3

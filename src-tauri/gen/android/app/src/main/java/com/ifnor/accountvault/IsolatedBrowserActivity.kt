@@ -1,0 +1,1822 @@
+package com.ifnor.accountvault
+
+import android.app.Activity
+import android.app.ActivityManager
+import android.app.AlertDialog
+import android.app.Dialog
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewConfiguration
+import android.view.ViewGroup
+import android.view.Window
+import android.webkit.*
+import android.widget.*
+import androidx.annotation.Keep
+import org.json.JSONArray
+import org.json.JSONObject
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
+@Keep
+class IsolatedBrowserActivity : Activity() {
+
+    private lateinit var webView: WebView
+    private lateinit var progressBar: ProgressBar
+    private var email: String = ""
+    private var platformTitle: String = ""
+    private var sessionKey: String = ""
+    private var targetUrl: String = ""
+    private var password: String = ""
+    private var totpSecret: String = ""
+    private var recoveryEmail: String = ""
+    private var currentTotpCode: String = ""
+    private var currentTotpRemaining: Int = 30
+    private var profileKey: String = ""
+    private var isDesktopMode: Boolean = false
+    private var mobileUserAgent: String = ""
+    private var desktopUserAgent: String = ""
+
+    // Floating Pill states
+    private var showFloatingPill: Boolean = true
+    private lateinit var floatingPillContainer: FrameLayout
+    private lateinit var floatingCollapsedView: LinearLayout
+    private lateinit var floatingExpandedView: LinearLayout
+    private lateinit var floatingSummaryText: TextView
+    private var autoCollapseRunnable: Runnable? = null
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var totpRunnable: Runnable? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        try {
+            email = intent.getStringExtra("email") ?: ""
+            platformTitle = intent.getStringExtra("platformTitle") ?: ""
+            sessionKey = intent.getStringExtra("sessionKey") ?: ""
+            targetUrl = intent.getStringExtra("url") ?: "https://example.com/"
+            password = intent.getStringExtra("password") ?: ""
+            totpSecret = intent.getStringExtra("totpSecret") ?: ""
+            recoveryEmail = intent.getStringExtra("recoveryEmail") ?: ""
+
+            val keySeed = if (sessionKey.isNotBlank()) sessionKey else email
+            val rawHash = Math.abs(keySeed.trim().lowercase().hashCode()).toString(16)
+            profileKey = "vault_$rawHash"
+
+            // 1. Edge-to-Edge System Status & Navigation Bar setup
+            setupSystemBars()
+
+            // 2. Custom Task Description for Multitasking Overview
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                val taskTitle = when {
+                    platformTitle.isNotBlank() && email.isNotBlank() -> "$platformTitle · $email"
+                    email.isNotBlank() -> "沙箱 · $email"
+                    platformTitle.isNotBlank() -> platformTitle
+                    else -> "独立安全沙箱"
+                }
+                val taskDesc = ActivityManager.TaskDescription(
+                    taskTitle,
+                    null,
+                    Color.parseColor("#1A73E8")
+                )
+                setTaskDescription(taskDesc)
+            }
+
+            initViews()
+            setupWebView()
+            startTotpTicker()
+            loadUrlWithIsolation()
+        } catch (e: Throwable) {
+            android.util.Log.e("GoogleAccountVault", "Fatal error in IsolatedBrowserActivity.onCreate", e)
+            try {
+                Toast.makeText(this, "正在切换至系统浏览器打开...", Toast.LENGTH_SHORT).show()
+                val fallbackIntent = Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl)).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(fallbackIntent)
+            } catch (_: Throwable) {}
+            finish()
+        }
+    }
+
+    private fun setupSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            window.decorView.systemUiVisibility =
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+        }
+        window.statusBarColor = Color.TRANSPARENT
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            window.decorView.systemUiVisibility =
+                window.decorView.systemUiVisibility or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+            window.navigationBarColor = Color.parseColor("#F8FAFD")
+        }
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val newEmail = intent?.getStringExtra("email")
+        if (!newEmail.isNullOrBlank()) email = newEmail
+        val newPwd = intent?.getStringExtra("password")
+        if (!newPwd.isNullOrBlank()) password = newPwd
+        val newTotp = intent?.getStringExtra("totpSecret")
+        if (!newTotp.isNullOrBlank()) totpSecret = newTotp
+        val newRec = intent?.getStringExtra("recoveryEmail")
+        if (!newRec.isNullOrBlank()) recoveryEmail = newRec
+
+        val newUrl = intent?.getStringExtra("url")
+        if (!newUrl.isNullOrBlank() && newUrl != targetUrl) {
+            targetUrl = newUrl
+            if (::webView.isInitialized) {
+                webView.loadUrl(targetUrl)
+            }
+        }
+    }
+
+    private fun dpToPx(dp: Int): Int {
+        return (dp * resources.displayMetrics.density).toInt()
+    }
+
+    private fun initViews() {
+        val rootLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+            setBackgroundColor(Color.WHITE)
+        }
+
+        // ================= 1. Top Header Bar (WeChat Capsule Style) =================
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Color.parseColor("#F8FAFD"))
+            setPadding(dpToPx(8), dpToPx(8), dpToPx(8), dpToPx(8))
+        }
+
+        // 1.1 Left: Back to Main App Button (返回管家本体)
+        val hostBtnShape = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dpToPx(14).toFloat()
+            setColor(Color.parseColor("#E8F0FE"))
+        }
+        val backToHostBtn = TextView(this).apply {
+            text = "⇲ 管家"
+            textSize = 12f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#1A73E8"))
+            background = hostBtnShape
+            gravity = Gravity.CENTER
+            setPadding(dpToPx(8), dpToPx(4), dpToPx(8), dpToPx(4))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                dpToPx(30)
+            )
+            setOnClickListener {
+                try {
+                    val hostIntent = Intent(this@IsolatedBrowserActivity, MainActivity::class.java).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                    }
+                    startActivity(hostIntent)
+                } catch (_: Throwable) {
+                    moveTaskToBack(true)
+                }
+            }
+        }
+        topBar.addView(backToHostBtn)
+
+        // 1.2 Web Navigation Back Button (网页内后退)
+        val webBackBtn = TextView(this).apply {
+            text = "‹"
+            textSize = 22f
+            setTextColor(Color.parseColor("#5F6368"))
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dpToPx(28), dpToPx(36)).apply {
+                marginStart = dpToPx(2)
+            }
+            setOnClickListener {
+                if (::webView.isInitialized && webView.canGoBack()) {
+                    webView.goBack()
+                } else {
+                    moveTaskToBack(true)
+                }
+            }
+        }
+        topBar.addView(webBackBtn)
+
+        // 1.3 Center: Title & Email Subtitle
+        val centerInfo = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dpToPx(4)
+                marginEnd = dpToPx(4)
+            }
+        }
+        val titleView = TextView(this).apply {
+            text = if (platformTitle.isNotBlank()) "$platformTitle 独立沙箱 🔒" else "独立安全沙箱 🔒"
+            textSize = 13f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#202124"))
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        val subView = TextView(this).apply {
+            text = if (email.isNotBlank()) email else "独立会话"
+            textSize = 10.5f
+            setTextColor(Color.parseColor("#5F6368"))
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        centerInfo.addView(titleView)
+        centerInfo.addView(subView)
+        topBar.addView(centerInfo)
+
+        // 1.4 Right: WeChat Capsule Controller [ ··· | ✕ ]
+        val capsuleContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(dpToPx(76), dpToPx(32))
+            gravity = Gravity.CENTER_VERTICAL
+            val capsuleShape = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dpToPx(16).toFloat()
+                setColor(Color.WHITE)
+                setStroke(dpToPx(1), Color.parseColor("#DADCE0"))
+            }
+            background = capsuleShape
+        }
+
+        // More options button (···)
+        val moreBtn = TextView(this).apply {
+            text = "···"
+            textSize = 15f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#3C4043"))
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+            setOnClickListener {
+                showCapsuleMenu()
+            }
+        }
+        capsuleContainer.addView(moreBtn)
+
+        // Divider line (|)
+        val capsuleDivider = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dpToPx(1), dpToPx(16))
+            setBackgroundColor(Color.parseColor("#DADCE0"))
+        }
+        capsuleContainer.addView(capsuleDivider)
+
+        // Close button (✕)
+        val closeBtn = TextView(this).apply {
+            text = "✕"
+            textSize = 13f
+            setTextColor(Color.parseColor("#3C4043"))
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+            setOnClickListener {
+                closeSandboxTask()
+            }
+        }
+        capsuleContainer.addView(closeBtn)
+
+        topBar.addView(capsuleContainer)
+        rootLayout.addView(topBar)
+
+        // ================= 2. Loading Progress Bar =================
+        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dpToPx(3)
+            )
+            max = 100
+            progress = 0
+            visibility = View.GONE
+        }
+        rootLayout.addView(progressBar)
+
+        // ================= 3. Main Content Container (FrameLayout for 100% Fullscreen WebView + Floating Pill) =================
+        val contentContainer = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        }
+
+        webView = WebView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        }
+        contentContainer.addView(webView)
+
+        // ================= 4. Setup Collapsible Floating Pill =================
+        setupFloatingPill(contentContainer)
+
+        rootLayout.addView(contentContainer)
+
+        // ================= 5. WindowInsets (Status Bar & Bottom Gesture Bar Padding) =================
+        rootLayout.setOnApplyWindowInsetsListener { _, insets ->
+            val statusTop = insets.systemWindowInsetTop
+            val navBottom = insets.systemWindowInsetBottom
+            topBar.setPadding(dpToPx(8), statusTop + dpToPx(4), dpToPx(8), dpToPx(4))
+            contentContainer.setPadding(0, 0, 0, navBottom)
+            insets
+        }
+
+        setContentView(rootLayout)
+    }
+
+    private fun setupFloatingPill(container: FrameLayout) {
+        floatingPillContainer = FrameLayout(this).apply {
+            val lp = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.BOTTOM or Gravity.END
+                marginEnd = dpToPx(8)
+                bottomMargin = dpToPx(70)
+            }
+            layoutParams = lp
+            elevation = dpToPx(8).toFloat()
+        }
+
+        // 1. Collapsed View (默认小巧贴边药丸，带拖拽把手图标)
+        floatingCollapsedView = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dpToPx(10), dpToPx(7), dpToPx(12), dpToPx(7))
+            val bg = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dpToPx(18).toFloat()
+                setColor(Color.WHITE)
+                setStroke(dpToPx(1), Color.parseColor("#DADCE0"))
+            }
+            background = bg
+        }
+
+        floatingSummaryText = TextView(this).apply {
+            text = "⠿ ⏱️ 凭据"
+            textSize = 12f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#1A73E8"))
+        }
+        floatingCollapsedView.addView(floatingSummaryText)
+        floatingPillContainer.addView(floatingCollapsedView)
+
+        // 2. Expanded View (展开横向快捷条)
+        floatingExpandedView = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dpToPx(6), dpToPx(4), dpToPx(6), dpToPx(4))
+            val bg = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dpToPx(18).toFloat()
+                setColor(Color.parseColor("#F8FAFD"))
+                setStroke(dpToPx(1), Color.parseColor("#1A73E8"))
+            }
+            background = bg
+            visibility = View.GONE
+        }
+
+        // 2.1 填邮箱
+        val fEmailBtn = createMiniPillButton("📧 邮箱", "#FFFFFF", "#3C4043") {
+            fillEmailManually()
+            scheduleAutoCollapse()
+        }
+        floatingExpandedView.addView(fEmailBtn)
+
+        // 2.2 填密码
+        val fPwdBtn = createMiniPillButton("🔑 密码", "#FFFFFF", "#3C4043") {
+            fillPasswordManually()
+            scheduleAutoCollapse()
+        }
+        floatingExpandedView.addView(fPwdBtn)
+
+        // 2.3 填辅助邮箱
+        val fRecBtn = createMiniPillButton("🛡️ 辅助", "#FFFFFF", "#188038") {
+            fillRecoveryEmailManually()
+            scheduleAutoCollapse()
+        }
+        floatingExpandedView.addView(fRecBtn)
+
+        // 2.4 填 2FA
+        val fTotpBtn = createMiniPillButton("⏱️ 2FA", "#E8F0FE", "#1A73E8") {
+            fillTotpManually()
+            scheduleAutoCollapse()
+        }
+        floatingExpandedView.addView(fTotpBtn)
+
+        // 2.5 收起按钮 (›)
+        val fCloseBtn = TextView(this).apply {
+            text = "›"
+            textSize = 18f
+            setTextColor(Color.parseColor("#5F6368"))
+            gravity = Gravity.CENTER
+            setPadding(dpToPx(6), 0, dpToPx(4), 0)
+            setOnClickListener {
+                collapseFloatingPill()
+            }
+        }
+        floatingExpandedView.addView(fCloseBtn)
+
+        floatingPillContainer.addView(floatingExpandedView)
+        container.addView(floatingPillContainer)
+
+        // 解决拖拽误触发点击的关键：在 TouchListener 中精确区分点击与拖拽
+        setupFloatingDrag()
+    }
+
+    private fun createMiniPillButton(
+        label: String,
+        bgColorHex: String,
+        textColorHex: String,
+        onClick: () -> Unit
+    ): TextView {
+        val bg = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dpToPx(12).toFloat()
+            setColor(Color.parseColor(bgColorHex))
+            setStroke(dpToPx(1), Color.parseColor("#DADCE0"))
+        }
+        return TextView(this).apply {
+            text = label
+            textSize = 11.5f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor(textColorHex))
+            gravity = Gravity.CENTER
+            background = bg
+            setPadding(dpToPx(8), dpToPx(5), dpToPx(8), dpToPx(5))
+            val lp = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginStart = dpToPx(2)
+                marginEnd = dpToPx(2)
+            }
+            layoutParams = lp
+            setOnClickListener { onClick() }
+        }
+    }
+
+    private fun expandFloatingPill() {
+        floatingCollapsedView.visibility = View.GONE
+        floatingExpandedView.visibility = View.VISIBLE
+        scheduleAutoCollapse()
+    }
+
+    private fun collapseFloatingPill() {
+        autoCollapseRunnable?.let { mainHandler.removeCallbacks(it) }
+        floatingExpandedView.visibility = View.GONE
+        floatingCollapsedView.visibility = View.VISIBLE
+    }
+
+    private fun scheduleAutoCollapse() {
+        autoCollapseRunnable?.let { mainHandler.removeCallbacks(it) }
+        autoCollapseRunnable = Runnable {
+            collapseFloatingPill()
+        }
+        mainHandler.postDelayed(autoCollapseRunnable!!, 5000)
+    }
+
+    private var dY = 0f
+    private fun setupFloatingDrag() {
+        var startRawY = 0f
+        var startRawX = 0f
+        var isDragging = false
+        val touchSlop = ViewConfiguration.get(this).scaledTouchSlop
+
+        floatingCollapsedView.setOnTouchListener { view, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    startRawX = event.rawX
+                    startRawY = event.rawY
+                    dY = floatingPillContainer.y - event.rawY
+                    isDragging = false
+                    view.isPressed = true
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val deltaY = Math.abs(event.rawY - startRawY)
+                    val deltaX = Math.abs(event.rawX - startRawX)
+                    if (deltaY > touchSlop || deltaX > touchSlop) {
+                        isDragging = true
+                        view.isPressed = false
+                        val newY = event.rawY + dY
+                        val parent = floatingPillContainer.parent as? View
+                        if (parent != null) {
+                            val maxY = parent.height - floatingPillContainer.height - dpToPx(10)
+                            val minY = dpToPx(10).toFloat()
+                            floatingPillContainer.y = newY.coerceIn(minY, maxY.toFloat())
+                        }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    view.isPressed = false
+                    if (!isDragging) {
+                        // 仅在非拖拽状态下的纯点击才展开悬浮胶囊，彻底杜绝移动误触
+                        expandFloatingPill()
+                    }
+                    isDragging = false
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    view.isPressed = false
+                    isDragging = false
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    private fun updateFloatingPillText(remaining: Int = 30) {
+        if (!::floatingSummaryText.isInitialized) return
+        if (currentTotpCode.isNotBlank() && currentTotpCode != "------") {
+            floatingSummaryText.text = "⠿ ⏱️ $currentTotpCode (${remaining}s)"
+        } else if (recoveryEmail.isNotBlank()) {
+            floatingSummaryText.text = "⠿ 🛡️ 辅助凭据"
+        } else {
+            floatingSummaryText.text = "⠿ 🔑 快捷凭据"
+        }
+    }
+
+    /**
+     * 现代化微信小程序风【底部抽屉快捷面板】(Bottom Sheet ActionSheet)
+     */
+    private fun showCapsuleMenu() {
+        val current = if (::webView.isInitialized) (webView.url ?: targetUrl) else targetUrl
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+
+        val dialogRoot = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val bg = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadii = floatArrayOf(
+                    dpToPx(24).toFloat(), dpToPx(24).toFloat(),
+                    dpToPx(24).toFloat(), dpToPx(24).toFloat(),
+                    0f, 0f, 0f, 0f
+                )
+                setColor(Color.WHITE)
+            }
+            background = bg
+            setPadding(dpToPx(16), dpToPx(10), dpToPx(16), dpToPx(16))
+        }
+
+        // 1. 顶部手势指示条
+        val handle = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dpToPx(38), dpToPx(4)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                bottomMargin = dpToPx(12)
+            }
+            val handleBg = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dpToPx(2).toFloat()
+                setColor(Color.parseColor("#DADCE0"))
+            }
+            background = handleBg
+        }
+        dialogRoot.addView(handle)
+
+        // 2. 账号头部信息 (G 图标徽标 + 邮箱 + 隔离沙箱副标题 + 关闭 ✕)
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dpToPx(14)
+            }
+        }
+        val avatar = TextView(this).apply {
+            text = (platformTitle.firstOrNull() ?: email.firstOrNull() ?: 'A').uppercaseChar().toString()
+            textSize = 15f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#1A73E8"))
+            gravity = Gravity.CENTER
+            val avatarBg = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#E8F0FE"))
+            }
+            background = avatarBg
+            layoutParams = LinearLayout.LayoutParams(dpToPx(36), dpToPx(36))
+        }
+        header.addView(avatar)
+
+        val headerInfo = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dpToPx(10)
+                marginEnd = dpToPx(10)
+            }
+        }
+        val accountEmailTv = TextView(this).apply {
+            text = if (email.isNotBlank()) email else (if (platformTitle.isNotBlank()) platformTitle else "通用账号")
+            textSize = 14.5f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#202124"))
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        val accountSubTv = TextView(this).apply {
+            text = "独立安全沙箱 · 🔒 数据隔离"
+            textSize = 11f
+            setTextColor(Color.parseColor("#5F6368"))
+        }
+        headerInfo.addView(accountEmailTv)
+        headerInfo.addView(accountSubTv)
+        header.addView(headerInfo)
+
+        val closeHeaderBtn = TextView(this).apply {
+            text = "✕"
+            textSize = 15f
+            setTextColor(Color.parseColor("#5F6368"))
+            gravity = Gravity.CENTER
+            setPadding(dpToPx(8), dpToPx(8), dpToPx(8), dpToPx(8))
+            setOnClickListener { dialog.dismiss() }
+        }
+        header.addView(closeHeaderBtn)
+        dialogRoot.addView(header)
+
+        // 3. 凭据专区标题
+        val section1Title = TextView(this).apply {
+            text = "快捷凭据（轻触一键填入并复制）"
+            textSize = 11.5f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#5F6368"))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dpToPx(8)
+            }
+        }
+        dialogRoot.addView(section1Title)
+
+        // 4. 2x2 凭据卡片精致网格
+        // Row 1: 主邮箱 + 登录密码
+        val credRow1 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dpToPx(6)
+            }
+        }
+        val cardEmail = createCredentialCard(
+            "📧", "主邮箱",
+            if (email.isNotBlank()) email else "(未配置)",
+            "#1A73E8", "#F8FAFD", "#E8EAED"
+        ) {
+            fillEmailManually()
+            dialog.dismiss()
+        }
+        val cardPwd = createCredentialCard(
+            "🔑", "登录密码",
+            if (password.isNotBlank()) "••••••••" else "(未配置)",
+            "#202124", "#F8FAFD", "#E8EAED"
+        ) {
+            fillPasswordManually()
+            dialog.dismiss()
+        }
+        credRow1.addView(cardEmail)
+        credRow1.addView(cardPwd)
+        dialogRoot.addView(credRow1)
+
+        // Row 2: 辅助邮箱 + 2FA 动态码
+        val credRow2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dpToPx(14)
+            }
+        }
+        val cardRec = createCredentialCard(
+            "🛡️", "辅助邮箱",
+            if (recoveryEmail.isNotBlank()) recoveryEmail else "(未配置)",
+            "#188038", "#F8FAFD", "#E8EAED"
+        ) {
+            fillRecoveryEmailManually()
+            dialog.dismiss()
+        }
+        val cardTotp = createCredentialCard(
+            "⏱️", "2FA 动态码",
+            if (currentTotpCode.isNotBlank() && currentTotpCode != "------") "$currentTotpCode (${currentTotpRemaining}s)" else "(未配置)",
+            "#1A73E8", "#E8F0FE", "#D2E3FC"
+        ) {
+            fillTotpManually()
+            dialog.dismiss()
+        }
+        credRow2.addView(cardRec)
+        credRow2.addView(cardTotp)
+        dialogRoot.addView(credRow2)
+
+        // 5. 快捷工具专区标题
+        val section2Title = TextView(this).apply {
+            text = "沙箱快捷工具"
+            textSize = 11.5f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#5F6368"))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dpToPx(8)
+            }
+        }
+        dialogRoot.addView(section2Title)
+
+        // 6. 3 列宫格快捷操作按钮 (Row 1: 刷新 | 复制网址 | 外部打开)
+        val toolsRow1 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dpToPx(6)
+            }
+        }
+        val btnReload = createToolButton("🔄", "刷新页面") {
+            if (::webView.isInitialized) webView.reload()
+            dialog.dismiss()
+        }
+        val btnCopyUrl = createToolButton("📋", "复制网址") {
+            copyToClipboard("网址", current)
+            Toast.makeText(this@IsolatedBrowserActivity, "网址已复制到剪贴板", Toast.LENGTH_SHORT).show()
+            dialog.dismiss()
+        }
+        val btnOpenExt = createToolButton("🌐", "外部打开") {
+            try {
+                val extIntent = Intent(Intent.ACTION_VIEW, Uri.parse(current)).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(extIntent)
+            } catch (_: Exception) {
+                Toast.makeText(this@IsolatedBrowserActivity, "未找到可用外部浏览器", Toast.LENGTH_SHORT).show()
+            }
+            dialog.dismiss()
+        }
+        toolsRow1.addView(btnReload)
+        toolsRow1.addView(btnCopyUrl)
+        toolsRow1.addView(btnOpenExt)
+        dialogRoot.addView(toolsRow1)
+
+        // Tools Row 2: 切换 UA | 贴边悬浮球 | 清理沙箱
+        val toolsRow2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dpToPx(14)
+            }
+        }
+        val btnToggleUa = createToolButton(if (isDesktopMode) "📱" else "🖥️", if (isDesktopMode) "切移动版" else "切桌面版") {
+            toggleDesktopMode()
+            dialog.dismiss()
+        }
+        val btnTogglePill = createToolButton("🔘", if (showFloatingPill) "隐藏悬浮球" else "显示悬浮球") {
+            showFloatingPill = !showFloatingPill
+            if (::floatingPillContainer.isInitialized) {
+                floatingPillContainer.visibility = if (showFloatingPill) View.VISIBLE else View.GONE
+            }
+            Toast.makeText(this@IsolatedBrowserActivity, if (showFloatingPill) "已开启贴边悬浮球" else "已隐藏贴边悬浮球", Toast.LENGTH_SHORT).show()
+            dialog.dismiss()
+        }
+        val btnClear = createToolButton("🧹", "清理沙箱") {
+            dialog.dismiss()
+            clearSandboxStorage()
+        }
+        toolsRow2.addView(btnToggleUa)
+        toolsRow2.addView(btnTogglePill)
+        toolsRow2.addView(btnClear)
+        dialogRoot.addView(toolsRow2)
+
+        // 7. 底部关闭大按钮
+        val cancelBtn = TextView(this).apply {
+            text = "关闭面板"
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#3C4043"))
+            gravity = Gravity.CENTER
+            val cancelBg = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dpToPx(12).toFloat()
+                setColor(Color.parseColor("#F1F3F4"))
+            }
+            background = cancelBg
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dpToPx(44)
+            )
+            setOnClickListener { dialog.dismiss() }
+        }
+        dialogRoot.addView(cancelBtn)
+
+        dialog.setContentView(dialogRoot)
+        val window = dialog.window
+        if (window != null) {
+            window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            window.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            window.setGravity(Gravity.BOTTOM)
+            window.attributes?.windowAnimations = android.R.style.Animation_InputMethod
+        }
+        dialog.show()
+    }
+
+    private fun createCredentialCard(
+        icon: String,
+        label: String,
+        value: String,
+        valueColorHex: String,
+        bgColorHex: String,
+        borderColorHex: String,
+        onClick: () -> Unit
+    ): LinearLayout {
+        val bg = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dpToPx(12).toFloat()
+            setColor(Color.parseColor(bgColorHex))
+            setStroke(dpToPx(1), Color.parseColor(borderColorHex))
+        }
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = bg
+            setPadding(dpToPx(10), dpToPx(10), dpToPx(10), dpToPx(10))
+            isClickable = true
+            isFocusable = true
+            val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dpToPx(3)
+                marginEnd = dpToPx(3)
+            }
+            layoutParams = lp
+            setOnClickListener { onClick() }
+        }
+
+        // Top Row: Icon + Label
+        val topRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val iconTv = TextView(this).apply {
+            text = icon
+            textSize = 13f
+        }
+        val labelTv = TextView(this).apply {
+            text = " $label"
+            textSize = 11.5f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.parseColor("#3C4043"))
+        }
+        topRow.addView(iconTv)
+        topRow.addView(labelTv)
+        card.addView(topRow)
+
+        // Bottom Row: Value
+        val valueTv = TextView(this).apply {
+            text = value
+            textSize = 12f
+            setTextColor(Color.parseColor(valueColorHex))
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(0, dpToPx(4), 0, 0)
+        }
+        card.addView(valueTv)
+
+        return card
+    }
+
+    private fun createToolButton(
+        icon: String,
+        label: String,
+        onClick: () -> Unit
+    ): LinearLayout {
+        val bg = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dpToPx(10).toFloat()
+            setColor(Color.parseColor("#F8FAFD"))
+            setStroke(dpToPx(1), Color.parseColor("#E8EAED"))
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            background = bg
+            setPadding(dpToPx(4), dpToPx(10), dpToPx(4), dpToPx(10))
+            isClickable = true
+            isFocusable = true
+            val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dpToPx(3)
+                marginEnd = dpToPx(3)
+            }
+            layoutParams = lp
+            setOnClickListener { onClick() }
+
+            val iconTv = TextView(this@IsolatedBrowserActivity).apply {
+                text = icon
+                textSize = 18f
+                gravity = Gravity.CENTER
+            }
+            val labelTv = TextView(this@IsolatedBrowserActivity).apply {
+                text = label
+                textSize = 11f
+                setTextColor(Color.parseColor("#3C4043"))
+                gravity = Gravity.CENTER
+                setPadding(0, dpToPx(4), 0, 0)
+            }
+            addView(iconTv)
+            addView(labelTv)
+        }
+    }
+
+    private fun toggleDesktopMode() {
+        if (!::webView.isInitialized) return
+        isDesktopMode = !isDesktopMode
+        val s = webView.settings
+        if (isDesktopMode) {
+            s.userAgentString = desktopUserAgent
+            s.useWideViewPort = true
+            s.loadWithOverviewMode = true
+            Toast.makeText(this, "已切换为桌面版 UA", Toast.LENGTH_SHORT).show()
+        } else {
+            s.userAgentString = mobileUserAgent
+            s.useWideViewPort = true
+            s.loadWithOverviewMode = false
+            Toast.makeText(this, "已切换为移动版 UA", Toast.LENGTH_SHORT).show()
+        }
+        webView.reload()
+    }
+
+    private fun clearSandboxStorage() {
+        AlertDialog.Builder(this)
+            .setTitle("清理独立沙箱")
+            .setMessage("确定要清除【$email】此沙箱下的所有 Cookie 与本地缓存吗？这会登出当前 Google 会话。")
+            .setPositiveButton("确定清理") { _, _ ->
+                try {
+                    if (::webView.isInitialized) {
+                        webView.clearCache(true)
+                        webView.clearFormData()
+                        webView.clearHistory()
+                    }
+                    val prefs = getSharedPreferences("vault_account_cookies", Context.MODE_PRIVATE)
+                    prefs.edit().remove(profileKey).apply()
+                    if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.MULTI_PROFILE)) {
+                        try {
+                            val profileStore = androidx.webkit.ProfileStore.getInstance()
+                            profileStore.getProfile(profileKey)?.cookieManager?.removeAllCookies(null)
+                        } catch (_: Throwable) {}
+                    }
+                    Toast.makeText(this, "沙箱 Cookie 与缓存已清理", Toast.LENGTH_SHORT).show()
+                    if (::webView.isInitialized) {
+                        webView.loadUrl(targetUrl)
+                    }
+                } catch (e: Throwable) {
+                    Toast.makeText(this, "清理失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun closeSandboxTask() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            finishAndRemoveTask()
+        } else {
+            finish()
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (::webView.isInitialized && webView.canGoBack()) {
+            webView.goBack()
+        } else {
+            // 如同微信小程序，根页面按返回键时退至后台（挂起），不直接销毁
+            moveTaskToBack(true)
+        }
+    }
+
+    private fun setupWebView() {
+        val s = webView.settings
+        s.javaScriptEnabled = true
+        s.domStorageEnabled = true
+        s.setSupportMultipleWindows(false)
+        s.javaScriptCanOpenWindowsAutomatically = true
+        s.allowFileAccess = false
+        s.allowContentAccess = false
+        s.useWideViewPort = true
+        s.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+
+        // Preserve real system Chromium version to match Sec-CH-UA Client Hints, while removing '; wv' marker
+        val sysUa = s.userAgentString ?: ""
+        val cleanMobileUa = if (sysUa.isNotBlank()) {
+            sysUa.replace("; wv)", ")").replace("; wv;", ";").replace(" wv ", " ")
+        } else {
+            "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36"
+        }
+        val chromeVerMatch = Regex("Chrome/([0-9.]+)").find(cleanMobileUa)
+        val chromeVer = chromeVerMatch?.groupValues?.getOrNull(1) ?: "134.0.0.0"
+        mobileUserAgent = cleanMobileUa
+        desktopUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$chromeVer Safari/537.36"
+        s.userAgentString = mobileUserAgent
+
+        // Ensure third-party cookies are accepted for Google cross-domain authentication
+        try {
+            val cm = CookieManager.getInstance()
+            cm.setAcceptCookie(true)
+            cm.setAcceptThirdPartyCookies(webView, true)
+        } catch (_: Throwable) {}
+
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                if (newProgress < 100) {
+                    progressBar.visibility = View.VISIBLE
+                    progressBar.progress = newProgress
+                } else {
+                    progressBar.visibility = View.GONE
+                }
+            }
+        }
+
+        webView.addJavascriptInterface(object {
+            @JavascriptInterface
+            fun copyText(text: String) {
+                mainHandler.post {
+                    copyToClipboard("授权回调内容", text)
+                }
+            }
+
+            @JavascriptInterface
+            fun jumpToUrl(url: String) {
+                mainHandler.post {
+                    triggerLocalCallbackInBackground(url, isManual = true)
+                }
+            }
+
+            @JavascriptInterface
+            fun getRealtimeTotp(): String {
+                return if (totpSecret.isNotBlank()) {
+                    try {
+                        TotpHelper.generateTotp(totpSecret).first
+                    } catch (_: Throwable) {
+                        currentTotpCode
+                    }
+                } else {
+                    ""
+                }
+            }
+        }, "GVaultBridge")
+
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                if (url != null && isLocalhostCallback(url) && !allowLocalhostPassthrough) {
+                    view?.stopLoading()
+                    renderLocalhostCallbackPage(url)
+                    return
+                }
+                super.onPageStarted(view, url, favicon)
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                injectAutofillScript()
+                CookieIsolationHelper.saveCookies(this@IsolatedBrowserActivity, webView, profileKey, url)
+            }
+
+            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                val reqUrl = request?.url?.toString() ?: ""
+                if (request?.isForMainFrame == true && isLocalhostCallback(reqUrl) && !allowLocalhostPassthrough) {
+                    triggerLocalCallbackInBackground(reqUrl)
+                    val htmlBytes = buildLocalhostCallbackHtml(reqUrl).toByteArray(Charsets.UTF_8)
+                    return WebResourceResponse("text/html", "UTF-8", java.io.ByteArrayInputStream(htmlBytes))
+                }
+                return super.shouldInterceptRequest(view, request)
+            }
+
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val nextUrl = request?.url?.toString() ?: ""
+                return handleUrl(nextUrl)
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
+                return handleUrl(url ?: "")
+            }
+
+            override fun onReceivedError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                error: WebResourceError?
+            ) {
+                val failingUrl = request?.url?.toString() ?: ""
+                if (request?.isForMainFrame == true && isLocalhostCallback(failingUrl) && !allowLocalhostPassthrough) {
+                    renderLocalhostCallbackPage(failingUrl)
+                    return
+                }
+                super.onReceivedError(view, request, error)
+            }
+
+            private fun isLocalhostCallback(rawUrl: String): Boolean {
+                return try {
+                    val u = Uri.parse(rawUrl)
+                    val scheme = u.scheme?.lowercase() ?: ""
+                    if (scheme != "http" && scheme != "https") return false
+                    val host = u.host?.lowercase() ?: ""
+                    host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "0.0.0.0"
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+
+            private fun handleUrl(nextUrl: String): Boolean {
+                if (isLocalhostCallback(nextUrl) && !allowLocalhostPassthrough) {
+                    renderLocalhostCallbackPage(nextUrl)
+                    return true
+                }
+                if (nextUrl.startsWith("http://") || nextUrl.startsWith("https://")) {
+                    return false
+                }
+                // Block external app deep-links (intent://, market://, app schemes) from hijacking the sandbox login flow
+                return true
+            }
+        }
+    }
+
+    @Volatile
+    private var allowLocalhostPassthrough: Boolean = false
+
+    private fun buildLocalhostCallbackHtml(callbackUrl: String): String {
+        val u = try { Uri.parse(callbackUrl) } catch (_: Throwable) { null }
+        val portStr = if (u != null && u.port != -1) "端口: ${u.port}" else "本地回环"
+        var codeParam = try { u?.getQueryParameter("code") ?: "" } catch (_: Throwable) { "" }
+        if (codeParam.isEmpty() && u?.fragment != null) {
+            try {
+                val fragUri = Uri.parse("http://localhost/?" + u.fragment)
+                codeParam = fragUri.getQueryParameter("code") ?: fragUri.getQueryParameter("access_token") ?: ""
+            } catch (_: Throwable) {}
+        }
+
+        val urlJson = JSONObject.quote(callbackUrl)
+        val codeJson = JSONObject.quote(codeParam)
+        val safeUrlHtml = android.text.Html.escapeHtml(callbackUrl)
+        val safeEmailHtml = android.text.Html.escapeHtml(email)
+        val safePortHtml = android.text.Html.escapeHtml(portStr)
+        val safeCodeHtml = android.text.Html.escapeHtml(codeParam)
+
+        val codeSectionHtml = if (codeParam.isNotEmpty()) {
+            """
+            <div style="margin-top:16px;padding:14px 16px;background:#f8fafd;border-radius:16px;border:1px solid #dadce0;display:flex;align-items:center;justify-content:space-between;gap:12px;">
+                <div style="min-width:0;flex:1;text-align:left;">
+                    <div style="font-size:12px;color:#5f6368;font-weight:500;">已自动提取授权码 (<code style="color:#1a73e8;font-family:monospace;">code</code> 参数)</div>
+                    <div id="gvaultCodeVal" style="font-family:monospace;font-size:12px;font-weight:600;color:#202124;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px;user-select:all;">$safeCodeHtml</div>
+                </div>
+                <button id="gvaultCopyCodeBtn" type="button" onclick="copyCode()" style="padding:7px 14px;background:#ffffff;color:#1a73e8;border:1px solid #dadce0;border-radius:12px;font-size:12px;font-weight:600;flex-shrink:0;">
+                    仅复制 Code
+                </button>
+            </div>
+            """
+        } else ""
+
+        return """
+            <!DOCTYPE html>
+            <html lang="zh-CN">
+            <head>
+                <meta charset="utf-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+                <title>已捕获回调地址</title>
+            </head>
+            <body style="margin:0;padding:18px;min-height:90vh;background:#f0f4f9;display:flex;align-items:center;justify-content:center;font-family:sans-serif;box-sizing:border-box;">
+                <div style="width:100%;max-width:480px;background:#ffffff;color:#202124;border:1px solid #dadce0;border-radius:24px;padding:24px;box-shadow:0 10px 28px rgba(0,0,0,0.08);box-sizing:border-box;">
+                    <div style="display:flex;flex-direction:column;align-items:center;text-align:center;margin-bottom:18px;">
+                        <div style="margin-bottom:10px;display:flex;align-items:center;justify-content:center;">
+                            <svg style="width:40px;height:40px;" viewBox="0 0 24 24" fill="none">
+                                <path d="M12 2a10 10 0 0 1 7.07 2.93l-2.83 2.83A6 6 0 0 0 12 6V2z" fill="#EA4335" />
+                                <path d="M19.07 4.93A10 10 0 0 1 22 12h-4a6 6 0 0 0-1.76-4.24l2.83-2.83z" fill="#FBBC05" />
+                                <path d="M22 12a10 10 0 0 1-10 10v-4a6 6 0 0 0 6-6h4z" fill="#34A853" />
+                                <path d="M12 22A10 10 0 0 1 2 12h4a6 6 0 0 0 6 6v4z" fill="#4285F4" />
+                                <path d="M2 12A10 10 0 0 1 12 2v4a6 6 0 0 0-6 6H2z" fill="#4285F4" opacity="0.85" />
+                            </svg>
+                        </div>
+
+                        <h1 style="font-size:16px;font-weight:700;color:#202124;margin:2px 0;">已捕获回调地址</h1>
+                        <p style="font-size:12px;color:#5f6368;margin:4px 0 0 0;">当前授权账号：<span style="font-weight:600;color:#1a73e8;">$safeEmailHtml</span></p>
+                        <div id="gvaultLocalSyncNote" style="margin-top:10px;width:100%;padding:8px 12px;border-radius:12px;background:#f0fdf4;border:1px solid #bbf7d0;font-size:11.5px;color:#166534;line-height:1.45;box-sizing:border-box;">
+                            ⚡ 正在同步将授权结果送达监听服务…
+                        </div>
+                    </div>
+
+                    <div>
+                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                            <label style="font-size:12px;font-weight:600;color:#3c4043;">完整回调地址 (Callback URL)</label>
+                            <span style="font-size:12px;color:#80868b;font-family:monospace;">$safePortHtml</span>
+                        </div>
+
+                        <textarea id="gvaultUrlInput" readonly rows="4" onclick="this.select()" style="width:100%;padding:12px;background:#f8fafd;border-radius:16px;border:1px solid #dadce0;font-family:monospace;font-size:12px;color:#202124;outline:none;resize:none;line-height:1.5;word-break:break-all;box-sizing:border-box;">$safeUrlHtml</textarea>
+
+                        <button id="gvaultCopyUrlBtn" type="button" onclick="copyFull()" style="margin-top:10px;width:100%;padding:11px 16px;background:#1a73e8;color:#ffffff;border:none;border-radius:12px;font-size:13px;font-weight:600;display:flex;align-items:center;justify-content:center;gap:8px;box-shadow:0 2px 6px rgba(26,115,232,0.25);">
+                            <span id="gvaultCopyBtnText">一键复制完整回调地址</span>
+                        </button>
+
+                        <button id="gvaultJumpBtn" type="button" onclick="jumpToCallback()" style="margin-top:10px;width:100%;padding:10px 16px;background:#ffffff;color:#1a73e8;border:1px solid #dadce0;border-radius:12px;font-size:13px;font-weight:600;display:flex;align-items:center;justify-content:center;gap:8px;">
+                            <span id="gvaultJumpBtnText">跳转回调地址</span>
+                        </button>
+                    </div>
+
+                    $codeSectionHtml
+                </div>
+
+                <script>
+                    const fullUrl = $urlJson;
+                    const codeVal = $codeJson;
+                    function doCopy(txt) {
+                        if (window.GVaultBridge && window.GVaultBridge.copyText) {
+                            window.GVaultBridge.copyText(txt);
+                            return;
+                        }
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(txt);
+                        } else {
+                            const ta = document.createElement('textarea');
+                            ta.value = txt;
+                            document.body.appendChild(ta);
+                            ta.select();
+                            document.execCommand('copy');
+                            document.body.removeChild(ta);
+                        }
+                    }
+                    function copyFull() {
+                        const input = document.getElementById('gvaultUrlInput');
+                        if (input) input.select();
+                        doCopy(fullUrl);
+                        const btn = document.getElementById('gvaultCopyUrlBtn');
+                        const txt = document.getElementById('gvaultCopyBtnText');
+                        btn.style.background = '#059669';
+                        txt.innerText = '✓ 已成功复制完整回调地址！';
+                        setTimeout(() => {
+                            btn.style.background = '#1a73e8';
+                            txt.innerText = '一键复制完整回调地址';
+                        }, 2000);
+                    }
+                    let jumpResetTimer = null;
+                    function jumpToCallback() {
+                        const txt = document.getElementById('gvaultJumpBtnText');
+                        const note = document.getElementById('gvaultLocalSyncNote');
+                        if (txt) txt.innerText = '正在触发回调地址…';
+                        if (note) {
+                            note.style.background = '#f0fdf4';
+                            note.style.borderColor = '#bbf7d0';
+                            note.style.color = '#166534';
+                            note.innerHTML = '⚡ 正在同步将授权结果送达监听服务…';
+                        }
+                        if (window.GVaultBridge && window.GVaultBridge.jumpToUrl) {
+                            window.GVaultBridge.jumpToUrl(fullUrl);
+                        }
+                    }
+                    function copyCode() {
+                        doCopy(codeVal);
+                        const btn = document.getElementById('gvaultCopyCodeBtn');
+                        btn.innerText = '✓ 已复制';
+                        btn.style.background = '#ecfdf5';
+                        btn.style.color = '#047857';
+                        setTimeout(() => {
+                            btn.innerText = '仅复制 Code';
+                            btn.style.background = '#ffffff';
+                            btn.style.color = '#1a73e8';
+                        }, 2000);
+                    }
+                    window.__gvaultSetLocalStatus = function(localOk, isManual) {
+                        const note = document.getElementById('gvaultLocalSyncNote');
+                        const jumpBtn = document.getElementById('gvaultJumpBtn');
+                        const jumpBtnText = document.getElementById('gvaultJumpBtnText');
+                        if (localOk) {
+                            if (note) {
+                                note.style.background = '#ecfdf5';
+                                note.style.borderColor = '#6ee7b7';
+                                note.style.color = '#065f46';
+                                note.innerHTML = '✓ 回调已完成，已同步将授权结果送达监听服务';
+                            }
+                            if (isManual && jumpBtn && jumpBtnText) {
+                                jumpBtn.style.background = '#ecfdf5';
+                                jumpBtn.style.color = '#047857';
+                                jumpBtn.style.borderColor = '#6ee7b7';
+                                jumpBtnText.innerText = '✓ 已完成回调地址跳转！';
+                            }
+                        } else {
+                            if (note) {
+                                note.style.background = '#eff6ff';
+                                note.style.borderColor = '#bfdbfe';
+                                note.style.color = '#1e40af';
+                                note.innerHTML = 'ℹ️ 未检测到本机开启该端口监听，请直接点击下方按钮复制回调地址或 Code';
+                            }
+                            if (isManual && jumpBtn && jumpBtnText) {
+                                jumpBtn.style.background = '#eff6ff';
+                                jumpBtn.style.color = '#1e40af';
+                                jumpBtn.style.borderColor = '#bfdbfe';
+                                jumpBtnText.innerText = '✓ 已触发回调（本机未监听该端口）';
+                            }
+                        }
+                        if (isManual && jumpBtn && jumpBtnText) {
+                            if (jumpResetTimer) clearTimeout(jumpResetTimer);
+                            jumpResetTimer = setTimeout(() => {
+                                jumpBtn.style.background = '#ffffff';
+                                jumpBtn.style.color = '#1a73e8';
+                                jumpBtn.style.borderColor = '#dadce0';
+                                jumpBtnText.innerText = '跳转回调地址';
+                            }, 2200);
+                        }
+                    };
+                </script>
+            </body>
+            </html>
+        """.trimIndent()
+    }
+
+    private var lastTriggeredLocalUrl: String = ""
+
+    private fun triggerLocalCallbackInBackground(callbackUrl: String, isManual: Boolean = false) {
+        if (callbackUrl.isBlank()) return
+        if (!isManual && callbackUrl == lastTriggeredLocalUrl) return
+        lastTriggeredLocalUrl = callbackUrl
+        Thread {
+            var localOk = false
+            try {
+                val conn = java.net.URL(callbackUrl).openConnection(java.net.Proxy.NO_PROXY) as java.net.HttpURLConnection
+                conn.connectTimeout = 4000
+                conn.readTimeout = 6000
+                conn.instanceFollowRedirects = false
+                conn.requestMethod = "GET"
+                val statusCode = conn.responseCode
+                localOk = statusCode > 0
+                conn.disconnect()
+            } catch (_: Throwable) {
+                localOk = false
+            }
+            val js = "if(window.__gvaultSetLocalStatus){window.__gvaultSetLocalStatus($localOk,$isManual);}"
+            val delays = if (isManual) listOf(0L, 120L) else listOf(0L, 150L, 500L)
+            for (delay in delays) {
+                mainHandler.postDelayed({
+                    if (::webView.isInitialized) {
+                        webView.evaluateJavascript(js, null)
+                    }
+                }, delay)
+            }
+        }.start()
+    }
+
+    private fun renderLocalhostCallbackPage(callbackUrl: String) {
+        if (!::webView.isInitialized) return
+        triggerLocalCallbackInBackground(callbackUrl)
+        val html = buildLocalhostCallbackHtml(callbackUrl)
+        webView.loadDataWithBaseURL("https://localhost/", html, "text/html", "UTF-8", null)
+    }
+
+    private fun loadUrlWithIsolation() {
+        CookieIsolationHelper.setupCookies(this, webView, profileKey)
+        webView.loadUrl(targetUrl)
+    }
+
+    private fun injectAutofillScript() {
+        if (!::webView.isInitialized) return
+        val emailJson = JSONObject.quote(email)
+        val pwdJson = JSONObject.quote(password)
+        val totpJson = JSONObject.quote(currentTotpCode)
+        val recJson = JSONObject.quote(recoveryEmail)
+
+        val js = """
+            (function() {
+                const targetEmail = $emailJson;
+                const targetPassword = $pwdJson;
+                const fallbackTotp = $totpJson;
+                const targetRec = $recJson;
+                let emailFilled = false;
+                let pwdFilled = false;
+                let totpFilled = false;
+                let lastAutoFilledTotp = "";
+                let recFilled = false;
+
+                function getLiveTotp() {
+                    try {
+                        if (window.GVaultBridge && window.GVaultBridge.getRealtimeTotp) {
+                            return window.GVaultBridge.getRealtimeTotp() || fallbackTotp;
+                        }
+                    } catch (_) {}
+                    return fallbackTotp;
+                }
+
+                function isRegisterPage() {
+                    const p = (window.location.pathname || "").toLowerCase();
+                    if (p.includes("register") || p.includes("signup") || p.includes("sign-up") || p.includes("create-account")) {
+                        return true;
+                    }
+                    if (document.querySelector('input[autocomplete="new-password"]')) {
+                        return true;
+                    }
+                    const pwds = Array.from(document.querySelectorAll('input[type="password"]')).filter(el => el.offsetParent !== null);
+                    return pwds.length >= 2;
+                }
+
+                function autoFill() {
+                    if (isRegisterPage()) return;
+                    // 1. Account / Email Fill
+                    if (targetEmail && !emailFilled) {
+                        const emailInput = document.getElementById("identifierId") || 
+                                           document.querySelector('input[autocomplete="username"]') ||
+                                           document.querySelector('input[autocomplete="email"]') ||
+                                           document.querySelector('input[type="email"]') ||
+                                           document.querySelector('input[name="login"]') ||
+                                           document.querySelector('input[name="username"]') ||
+                                           document.querySelector('input[name="account"]') ||
+                                           document.querySelector('input[name="identifier"]');
+                        if (emailInput && emailInput.offsetParent !== null && !emailInput.value) {
+                            emailInput.focus();
+                            emailInput.value = targetEmail;
+                            emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+                            emailInput.dispatchEvent(new Event("change", { bubbles: true }));
+                            emailFilled = true;
+                        }
+                    }
+
+                    // 2. Password Fill
+                    if (targetPassword && !pwdFilled) {
+                        const pwdInput = document.querySelector('input[name="Passwd"]') ||
+                                         document.querySelector('input[autocomplete="current-password"]') ||
+                                         document.querySelector('input[type="password"]');
+                        if (pwdInput && pwdInput.offsetParent !== null && !pwdInput.value) {
+                            pwdInput.focus();
+                            pwdInput.value = targetPassword;
+                            pwdInput.dispatchEvent(new Event("input", { bubbles: true }));
+                            pwdInput.dispatchEvent(new Event("change", { bubbles: true }));
+                            pwdFilled = true;
+                        }
+                    }
+
+                    // 3. 2FA Code Fill (real-time calculation + auto refresh on 30s rollover)
+                    const totpInput = document.querySelector('input[name="totpPin"]') ||
+                                      document.getElementById("idvPin") ||
+                                      document.querySelector('input[autocomplete="one-time-code"]') ||
+                                      document.querySelector('input[name*="totp" i]') ||
+                                      document.querySelector('input[name*="otp" i]') ||
+                                      document.querySelector('input[type="tel"][maxlength="6"]') ||
+                                      document.querySelector('input[inputmode="numeric"][maxlength="6"]');
+                    if (totpInput && totpInput.offsetParent !== null) {
+                        const liveTotp = getLiveTotp();
+                        if (liveTotp) {
+                            const shouldUpdate = !totpFilled || (totpInput.value === lastAutoFilledTotp && totpInput.value !== liveTotp);
+                            if (shouldUpdate && totpInput.value !== liveTotp) {
+                                totpInput.focus();
+                                totpInput.value = liveTotp;
+                                totpInput.dispatchEvent(new Event("input", { bubbles: true }));
+                                totpInput.dispatchEvent(new Event("change", { bubbles: true }));
+                                lastAutoFilledTotp = liveTotp;
+                                totpFilled = true;
+                            }
+                        }
+                    }
+
+                    // 4. Recovery Email Fill
+                    if (targetRec && !recFilled) {
+                        const recInput = document.getElementById("knowledge-preregistered-email-response") ||
+                                         document.querySelector('input[name="knowledgePreregisteredEmailResponse"]') ||
+                                         document.querySelector('input[type="email"][aria-label*="辅助"]') ||
+                                         document.querySelector('input[type="email"][aria-label*="recovery"]');
+                        if (recInput && recInput.offsetParent !== null && recInput.value !== targetRec) {
+                            recInput.focus();
+                            recInput.value = targetRec;
+                            recInput.dispatchEvent(new Event("input", { bubbles: true }));
+                            recInput.dispatchEvent(new Event("change", { bubbles: true }));
+                            recFilled = true;
+                        }
+                    }
+                }
+
+                window.addEventListener("DOMContentLoaded", autoFill);
+                window.addEventListener("load", autoFill);
+                const observer = new MutationObserver(autoFill);
+                if (document.documentElement) {
+                    observer.observe(document.documentElement, { childList: true, subtree: true });
+                }
+                const timer = setInterval(autoFill, 500);
+                setTimeout(() => {
+                    clearInterval(timer);
+                    observer.disconnect();
+                }, 600000);
+            })();
+        """.trimIndent()
+
+        webView.evaluateJavascript(js, null)
+    }
+
+    private fun fillEmailManually() {
+        if (!::webView.isInitialized) return
+        if (email.isBlank()) {
+            Toast.makeText(this, "未配置邮箱", Toast.LENGTH_SHORT).show()
+            return
+        }
+        copyToClipboard("Google 邮箱", email)
+        val emailJson = JSONObject.quote(email)
+        val js = """
+            (function() {
+                const targetEmail = $emailJson;
+                const emailInput = document.getElementById("identifierId") || 
+                                   document.querySelector('input[type="email"]') ||
+                                   document.querySelector('input[name="identifier"]');
+                if (emailInput) {
+                    emailInput.focus();
+                    emailInput.value = targetEmail;
+                    emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+                    emailInput.dispatchEvent(new Event("change", { bubbles: true }));
+                    return true;
+                }
+                return false;
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) {
+            Toast.makeText(this, "已复制并填入邮箱", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun fillPasswordManually() {
+        if (!::webView.isInitialized) return
+        if (password.isBlank()) {
+            Toast.makeText(this, "未配置密码", Toast.LENGTH_SHORT).show()
+            return
+        }
+        copyToClipboard("Google 密码", password)
+        val pwdJson = JSONObject.quote(password)
+        val js = """
+            (function() {
+                const targetPwd = $pwdJson;
+                const pwdInput = document.querySelector('input[name="Passwd"]') ||
+                                 document.querySelector('input[type="password"]');
+                if (pwdInput) {
+                    pwdInput.focus();
+                    pwdInput.value = targetPwd;
+                    pwdInput.dispatchEvent(new Event("input", { bubbles: true }));
+                    pwdInput.dispatchEvent(new Event("change", { bubbles: true }));
+                    return true;
+                }
+                return false;
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) {
+            Toast.makeText(this, "已复制并填入密码", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun fillRecoveryEmailManually() {
+        if (!::webView.isInitialized) return
+        if (recoveryEmail.isBlank()) {
+            Toast.makeText(this, "该账号未配置辅助邮箱", Toast.LENGTH_SHORT).show()
+            return
+        }
+        copyToClipboard("辅助邮箱", recoveryEmail)
+        val recJson = JSONObject.quote(recoveryEmail)
+        val js = """
+            (function() {
+                const targetRec = $recJson;
+                const recInput = document.getElementById("knowledge-preregistered-email-response") ||
+                                 document.querySelector('input[name="knowledgePreregisteredEmailResponse"]') ||
+                                 document.querySelector('input[type="email"][aria-label*="辅助"]') ||
+                                 document.querySelector('input[type="email"][aria-label*="recovery"]') ||
+                                 document.querySelector('input[type="email"]') ||
+                                 document.querySelector('input[name="identifier"]');
+                if (recInput) {
+                    recInput.focus();
+                    recInput.value = targetRec;
+                    recInput.dispatchEvent(new Event("input", { bubbles: true }));
+                    recInput.dispatchEvent(new Event("change", { bubbles: true }));
+                    return true;
+                }
+                return false;
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) {
+            Toast.makeText(this, "已复制并填入辅助邮箱: $recoveryEmail", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun fillTotpManually() {
+        if (!::webView.isInitialized) return
+        if (currentTotpCode.isBlank()) {
+            Toast.makeText(this, "该账号未配置 2FA 密钥", Toast.LENGTH_SHORT).show()
+            return
+        }
+        copyToClipboard("2FA 动态码", currentTotpCode)
+        val totpJson = JSONObject.quote(currentTotpCode)
+        val js = """
+            (function() {
+                const targetTotp = $totpJson;
+                const totpInput = document.querySelector('input[name="totpPin"]') ||
+                                  document.getElementById("idvPin") ||
+                                  document.querySelector('input[type="tel"][maxlength="6"]') ||
+                                  document.querySelector('input[autocomplete="one-time-code"]');
+                if (totpInput) {
+                    totpInput.focus();
+                    totpInput.value = targetTotp;
+                    totpInput.dispatchEvent(new Event("input", { bubbles: true }));
+                    totpInput.dispatchEvent(new Event("change", { bubbles: true }));
+                    return true;
+                }
+                return false;
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(js) {
+            Toast.makeText(this, "已复制并填入动态码: $currentTotpCode", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun copyToClipboard(label: String, text: String) {
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText(label, text))
+        } catch (_: Throwable) {}
+    }
+
+    private fun startTotpTicker() {
+        if (totpSecret.isBlank()) {
+            updateFloatingPillText(30)
+            return
+        }
+
+        totpRunnable = object : Runnable {
+            override fun run() {
+                val (code, remaining) = TotpHelper.generateTotp(totpSecret)
+                currentTotpCode = code
+                currentTotpRemaining = remaining
+                updateFloatingPillText(remaining)
+                mainHandler.postDelayed(this, 1000)
+            }
+        }
+        totpRunnable?.run()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        if (::webView.isInitialized) {
+            CookieIsolationHelper.saveCookies(this, webView, profileKey, webView.url)
+        }
+    }
+
+    override fun onDestroy() {
+        totpRunnable?.let { mainHandler.removeCallbacks(it) }
+        autoCollapseRunnable?.let { mainHandler.removeCallbacks(it) }
+        if (::webView.isInitialized) {
+            CookieIsolationHelper.saveCookies(this, webView, profileKey, webView.url)
+            try {
+                webView.stopLoading()
+                webView.destroy()
+            } catch (_: Throwable) {}
+        }
+        super.onDestroy()
+    }
+}
+
+object TotpHelper {
+    fun generateTotp(secret: String): Pair<String, Int> {
+        val clean = secret.trim().replace(" ", "").replace("-", "").replace("=", "").uppercase()
+        if (clean.isEmpty()) return Pair("------", 30)
+        return try {
+            val keyBytes = decodeBase32(clean)
+            val timeStep = 30L
+            val epochSeconds = System.currentTimeMillis() / 1000L
+            val currentInterval = epochSeconds / timeStep
+            val remaining = (30 - (epochSeconds % 30)).toInt()
+
+            val data = ByteArray(8)
+            var v = currentInterval
+            for (i in 7 downTo 0) {
+                data[i] = (v and 0xFF).toByte()
+                v = v shr 8
+            }
+
+            val mac = Mac.getInstance("HmacSHA1")
+            mac.init(SecretKeySpec(keyBytes, "HmacSHA1"))
+            val hash = mac.doFinal(data)
+
+            val offset = (hash[hash.size - 1].toInt() and 0x0F)
+            val binary = ((hash[offset].toInt() and 0x7F) shl 24) or
+                    ((hash[offset + 1].toInt() and 0xFF) shl 16) or
+                    ((hash[offset + 2].toInt() and 0xFF) shl 8) or
+                    (hash[offset + 3].toInt() and 0xFF)
+
+            val otp = binary % 1000000
+            val codeStr = String.format("%06d", otp)
+            Pair(codeStr, remaining)
+        } catch (_: Throwable) {
+            Pair("------", 30)
+        }
+    }
+
+    private fun decodeBase32(base32: String): ByteArray {
+        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+        val out = java.io.ByteArrayOutputStream()
+        var buffer = 0
+        var bitsLeft = 0
+        for (c in base32) {
+            val index = alphabet.indexOf(c)
+            if (index < 0) continue
+            buffer = (buffer shl 5) or index
+            bitsLeft += 5
+            if (bitsLeft >= 8) {
+                out.write((buffer shr (bitsLeft - 8)) and 0xFF)
+                bitsLeft -= 8
+            }
+        }
+        return out.toByteArray()
+    }
+}
+
+object CookieIsolationHelper {
+    fun setupCookies(context: Context, webView: WebView, profileKey: String) {
+        try {
+            if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.MULTI_PROFILE)) {
+                try {
+                    val profileStore = androidx.webkit.ProfileStore.getInstance()
+                    val profile = profileStore.getOrCreateProfile(profileKey)
+                    androidx.webkit.WebViewCompat.setProfile(webView, profileKey)
+                    return
+                } catch (e: Throwable) {
+                    android.util.Log.w("IsolatedBrowser", "MultiProfile unavailable: ${e.message}")
+                }
+            }
+        } catch (e: Throwable) {
+            android.util.Log.w("IsolatedBrowser", "WebViewFeature check failed: ${e.message}")
+        }
+
+        // Fallback for older Android engines: restore account cookies into CookieManager
+        try {
+            val prefs = context.getSharedPreferences("vault_account_cookies", Context.MODE_PRIVATE)
+            val saved = prefs.getString(profileKey, null) ?: return
+            val cm = CookieManager.getInstance()
+            cm.setAcceptCookie(true)
+            cm.setAcceptThirdPartyCookies(webView, true)
+            val arr = JSONArray(saved)
+            for (i in 0 until arr.length()) {
+                val item = arr.getJSONObject(i)
+                val url = item.getString("url")
+                val cookie = item.getString("cookie")
+                cm.setCookie(url, cookie)
+            }
+            cm.flush()
+        } catch (e: Throwable) {
+            android.util.Log.e("IsolatedBrowser", "Error restoring cookies", e)
+        }
+    }
+
+    fun saveCookies(context: Context, webView: WebView, profileKey: String, currentUrl: String?) {
+        try {
+            if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.MULTI_PROFILE)) {
+                try {
+                    val profileStore = androidx.webkit.ProfileStore.getInstance()
+                    val profile = profileStore.getProfile(profileKey)
+                    profile?.cookieManager?.flush()
+                    return
+                } catch (_: Throwable) {}
+            }
+        } catch (_: Throwable) {}
+
+        try {
+            val cm = CookieManager.getInstance()
+            cm.flush()
+            if (currentUrl.isNullOrBlank()) return
+            val cookiesStr = cm.getCookie(currentUrl) ?: return
+
+            val prefs = context.getSharedPreferences("vault_account_cookies", Context.MODE_PRIVATE)
+            val arr = JSONArray()
+            val obj = JSONObject().apply {
+                put("url", currentUrl)
+                put("cookie", cookiesStr)
+            }
+            arr.put(obj)
+            prefs.edit().putString(profileKey, arr.toString()).apply()
+        } catch (e: Throwable) {
+            android.util.Log.e("IsolatedBrowser", "Error saving cookies", e)
+        }
+    }
+}

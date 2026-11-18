@@ -1,0 +1,21 @@
+{
+  "identifier": "mobile-capability",
+  "platforms": [
+    "android",
+    "iOS"
+  ],
+  "windows": [
+    "main",
+    "*"
+  ],
+  "permissions": [
+    "core:default",
+    "core:app:default",
+    "core:app:allow-exit",
+    "opener:default",
+    "biometric:default",
+    "biometric:allow-biometric-cipher",
+    "biometric:allow-authenticate",
+    "biometric:allow-status"
+  ]
+}
