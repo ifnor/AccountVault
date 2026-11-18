@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>AccountVault</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="brand">
+        <img src="icons/icon128.png" alt="AV" class="logo" />
+        <div>
+          <div class="title">AccountVault</div>
+          <div id="status-badge" class="status">检查状态中...</div>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="sync-btn" class="icon-btn hidden" title="同步云端">↻</button>
+        <button id="lock-btn" class="icon-btn hidden" title="锁定保险库">🔒</button>
+        <button id="toggle-settings" class="icon-btn" title="连接模式与设置">⚙</button>
+      </div>
+    </header>
+
+    <div id="settings-panel" class="panel hidden">
+      <label class="label">连接模式</label>
+      <div class="mode-tabs">
+        <button id="mode-bridge-btn" type="button" class="mode-tab">本地桌面桥接</button>
+        <button id="mode-webdav-btn" type="button" class="mode-tab">WebDAV 云端直连</button>
+      </div>
+
+      <div id="bridge-fields">
+        <label class="label">桌面端端口</label>
+        <input id="port-input" type="number" class="input" value="47291" />
+        <label class="label">配对密钥 (桌面端 设置 → 浏览器扩展 复制)</label>
+        <input id="token-input" type="password" class="input" placeholder="粘贴配对密钥" />
+      </div>
+
+      <div id="webdav-fields" class="hidden">
+        <label class="label">WebDAV 目录地址</label>
+        <input id="dav-url-input" type="url" class="input" placeholder="https://dav.example.com/AccountVault/" />
+        <label class="label">WebDAV 账号</label>
+        <input id="dav-user-input" type="text" class="input" placeholder="用户名 / 邮箱" />
+        <label class="label">WebDAV 应用密码</label>
+        <input id="dav-pass-input" type="password" class="input" placeholder="应用密码" />
+        <label class="label">空闲自动锁定（分钟，0 为关闭）</label>
+        <input id="idle-input" type="number" class="input" value="30" min="0" />
+        <div id="dav-test-msg" class="hint-msg"></div>
+      </div>
+
+      <label class="label">Passkey 弹窗样式</label>
+      <div class="mode-tabs">
+        <button id="style-window-btn" type="button" class="mode-tab">独立窗口弹窗</button>
+        <button id="style-overlay-btn" type="button" class="mode-tab">页面悬浮卡片</button>
+      </div>
+
+      <div class="row-actions">
+        <button id="test-dav-btn" type="button" class="btn hidden">测试连接</button>
+        <button id="save-config" type="button" class="btn primary">保存配置</button>
+      </div>
+    </div>
+
+    <div id="unlock-panel" class="panel hidden">
+      <div class="unlock-title">解锁 WebDAV 云端保险库</div>
+      <div class="unlock-desc">主密码仅用于本地 Scrypt + AES-256-GCM 解密，不会上传或明文保存。</div>
+      <input id="master-pwd-input" type="password" class="input" placeholder="输入主密码..." />
+      <div id="unlock-err" class="hint-msg err"></div>
+      <label class="label">Passkey 弹窗样式</label>
+      <div class="mode-tabs">
+        <button id="style-window-btn" type="button" class="mode-tab">独立窗口弹窗</button>
+        <button id="style-overlay-btn" type="button" class="mode-tab">页面悬浮卡片</button>
+      </div>
+
+      <div class="row-actions">
+        <button id="unlock-btn" type="button" class="btn primary">解锁并同步</button>
+      </div>
+    </div>
+
+    <div id="main-panel">
+      <input id="search-input" type="text" class="search" placeholder="搜索全部账号 / 网站..." />
+      <div id="section-label" class="section-label">当前网站匹配</div>
+      <div id="list" class="list"></div>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
