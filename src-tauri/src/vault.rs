@@ -264,6 +264,12 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             cipher_blob TEXT NOT NULL,
             updated_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS favicon_cache (
+            domain TEXT PRIMARY KEY,
+            data_url TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
         ",
     )
     .map_err(|e| format!("初始化 SQLite 表结构失败: {e}"))
@@ -377,6 +383,59 @@ pub fn delete_encrypted_setting(setting_key: &str) -> Result<(), String> {
         params![setting_key],
     )
     .map_err(|e| format!("删除配置失败: {e}"))?;
+    Ok(())
+}
+
+pub fn load_all_cached_favicons() -> Result<std::collections::HashMap<String, String>, String> {
+    let db_path = vault_db_path();
+    if !db_path.exists() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let conn = open_connection(&db_path)?;
+    init_schema(&conn)?;
+    let mut stmt = conn
+        .prepare("SELECT domain, data_url FROM favicon_cache")
+        .map_err(|e| format!("查询头像缓存失败: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let domain: String = row.get(0)?;
+            let data_url: String = row.get(1)?;
+            Ok((domain, data_url))
+        })
+        .map_err(|e| format!("读取头像缓存失败: {e}"))?;
+    let mut map = std::collections::HashMap::new();
+    for item in rows.flatten() {
+        map.insert(item.0, item.1);
+    }
+    Ok(map)
+}
+
+pub fn get_cached_favicon(domain: &str) -> Result<Option<String>, String> {
+    let db_path = vault_db_path();
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_connection(&db_path)?;
+    init_schema(&conn)?;
+    conn.query_row(
+        "SELECT data_url FROM favicon_cache WHERE domain = ?1",
+        params![domain],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| format!("查询单条头像缓存失败: {e}"))
+}
+
+pub fn save_cached_favicon(domain: &str, data_url: &str) -> Result<(), String> {
+    let conn = open_connection(&vault_db_path())?;
+    init_schema(&conn)?;
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO favicon_cache (domain, data_url, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(domain) DO UPDATE SET data_url = excluded.data_url, updated_at = excluded.updated_at",
+        params![domain, data_url, now],
+    )
+    .map_err(|e| format!("保存头像缓存失败: {e}"))?;
     Ok(())
 }
 

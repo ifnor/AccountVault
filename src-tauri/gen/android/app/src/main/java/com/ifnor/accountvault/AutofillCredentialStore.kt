@@ -7,8 +7,20 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
+import java.math.BigInteger
 import java.nio.ByteBuffer
+import java.security.AlgorithmParameters
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
 import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.SecureRandom
+import java.security.Signature
+import java.security.interfaces.ECPrivateKey
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECParameterSpec
+import java.security.spec.ECPrivateKeySpec
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -16,13 +28,26 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
+data class AutofillPasskey(
+    val credentialId: String,
+    val rpId: String,
+    val rpName: String,
+    val userId: String,
+    val userName: String,
+    val userDisplayName: String,
+    val privateKeyJwk: String,
+    val publicKeySpki: String,
+    val signCount: Int
+)
+
 data class AutofillCred(
     val id: String,
     val title: String,
     val account: String,
     val password: String,
     val loginUrl: String,
-    val totpSecret: String
+    val totpSecret: String,
+    val passkeys: List<AutofillPasskey> = emptyList()
 )
 
 object AutofillCredentialStore {
@@ -89,7 +114,32 @@ object AutofillCredentialStore {
                 val obj = arr.optJSONObject(i) ?: continue
                 val account = obj.optString("account", "").trim()
                 val password = obj.optString("password", "")
-                if (account.isEmpty() && password.isEmpty()) continue
+                val pkArr = obj.optJSONArray("passkeys")
+                val passkeys = mutableListOf<AutofillPasskey>()
+                if (pkArr != null) {
+                    for (j in 0 until pkArr.length()) {
+                        val pk = pkArr.optJSONObject(j) ?: continue
+                        val cid = pk.optString("credential_id", "")
+                        val rpid = pk.optString("rp_id", "")
+                        val jwk = pk.optString("private_key_jwk", "")
+                        if (cid.isNotEmpty() && rpid.isNotEmpty() && jwk.isNotEmpty()) {
+                            passkeys.add(
+                                AutofillPasskey(
+                                    credentialId = cid,
+                                    rpId = rpid,
+                                    rpName = pk.optString("rp_name", ""),
+                                    userId = pk.optString("user_id", ""),
+                                    userName = pk.optString("user_name", ""),
+                                    userDisplayName = pk.optString("user_display_name", ""),
+                                    privateKeyJwk = jwk,
+                                    publicKeySpki = pk.optString("public_key_spki", ""),
+                                    signCount = pk.optInt("sign_count", 0)
+                                )
+                            )
+                        }
+                    }
+                }
+                if (account.isEmpty() && password.isEmpty() && passkeys.isEmpty()) continue
                 list.add(
                     AutofillCred(
                         id = obj.optString("id", ""),
@@ -97,7 +147,8 @@ object AutofillCredentialStore {
                         account = account,
                         password = password,
                         loginUrl = obj.optString("login_url", ""),
-                        totpSecret = obj.optString("totp", "")
+                        totpSecret = obj.optString("totp", ""),
+                        passkeys = passkeys
                     )
                 )
             }
@@ -317,5 +368,269 @@ object AutofillCredentialStore {
             }
         }
         return out.toByteArray()
+    }
+
+    // ==================== Passkey (WebAuthn ES256) Helpers ====================
+
+    private fun b64UrlEncode(bytes: ByteArray): String =
+        Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+
+    private fun b64UrlDecode(str: String): ByteArray =
+        Base64.decode(str, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+
+    private fun fixed32(bi: BigInteger): ByteArray {
+        val raw = bi.toByteArray()
+        val out = ByteArray(32)
+        if (raw.size >= 32) {
+            System.arraycopy(raw, raw.size - 32, out, 0, 32)
+        } else {
+            System.arraycopy(raw, 0, out, 32 - raw.size, raw.size)
+        }
+        return out
+    }
+
+    private fun cborHead(major: Int, len: Int): ByteArray {
+        val m = major shl 5
+        return when {
+            len < 24 -> byteArrayOf((m or len).toByte())
+            len < 256 -> byteArrayOf((m or 24).toByte(), len.toByte())
+            else -> byteArrayOf((m or 25).toByte(), (len shr 8).toByte(), (len and 0xFF).toByte())
+        }
+    }
+
+    private fun cborInt(v: Int): ByteArray =
+        if (v >= 0) cborHead(0, v) else cborHead(1, -1 - v)
+
+    private fun cborText(s: String): ByteArray {
+        val b = s.toByteArray(Charsets.UTF_8)
+        return cborHead(3, b.size) + b
+    }
+
+    private fun cborBytes(b: ByteArray): ByteArray = cborHead(2, b.size) + b
+
+    fun matchPasskeys(context: Context, rpId: String, allowIds: List<String> = emptyList()): List<Pair<AutofillCred, AutofillPasskey>> {
+        val target = extractHost(rpId)
+        if (target.isEmpty()) return emptyList()
+        val res = mutableListOf<Pair<AutofillCred, AutofillPasskey>>()
+        for (cred in getAllCredentials(context)) {
+            for (pk in cred.passkeys) {
+                val pkHost = extractHost(pk.rpId)
+                val domainOk = pkHost == target || target.endsWith(".$pkHost") || pkHost.endsWith(".$target")
+                val allowOk = allowIds.isEmpty() || allowIds.contains(pk.credentialId)
+                if (domainOk && allowOk) {
+                    res.add(Pair(cred, pk))
+                }
+            }
+        }
+        return res
+    }
+
+    fun createPasskeyAndBuildResponseJson(
+        context: Context,
+        requestJsonStr: String,
+        origin: String,
+        clientDataHash: ByteArray?
+    ): String {
+        val req = JSONObject(requestJsonStr)
+        val rp = req.optJSONObject("rp")
+        val rpId = rp?.optString("id", "")?.takeIf { it.isNotBlank() } ?: ""
+        val rpName = rp?.optString("name", rpId) ?: rpId
+        val user = req.optJSONObject("user")
+        val userIdB64 = user?.optString("id", "") ?: ""
+        val userName = user?.optString("name", "") ?: ""
+        val userDisplayName = user?.optString("displayName", userName) ?: userName
+        val challengeB64 = req.optString("challenge", "")
+
+        val kpg = KeyPairGenerator.getInstance("EC")
+        kpg.initialize(ECGenParameterSpec("secp256r1"))
+        val kp = kpg.generateKeyPair()
+        val pub = kp.public as ECPublicKey
+        val priv = kp.private as ECPrivateKey
+
+        val xBytes = fixed32(pub.w.affineX)
+        val yBytes = fixed32(pub.w.affineY)
+        val dBytes = fixed32(priv.s)
+
+        val jwk = JSONObject().apply {
+            put("kty", "EC")
+            put("crv", "P-256")
+            put("x", b64UrlEncode(xBytes))
+            put("y", b64UrlEncode(yBytes))
+            put("d", b64UrlEncode(dBytes))
+        }
+
+        val credIdBytes = ByteArray(32).apply { SecureRandom().nextBytes(this) }
+        val credIdB64 = b64UrlEncode(credIdBytes)
+
+        val clientDataJsonStr = JSONObject().apply {
+            put("type", "webauthn.create")
+            put("challenge", challengeB64)
+            put("origin", origin)
+            put("crossOrigin", false)
+        }.toString()
+        val clientDataBytes = clientDataJsonStr.toByteArray(Charsets.UTF_8)
+
+        val rpIdHash = MessageDigest.getInstance("SHA-256").digest(rpId.toByteArray(Charsets.UTF_8))
+        val flags = byteArrayOf(0x45) // UP | UV | AT
+        val signCount = ByteArray(4)
+        val aaguid = ByteArray(16)
+        val credIdLen = byteArrayOf(((credIdBytes.size shr 8) and 0xFF).toByte(), (credIdBytes.size and 0xFF).toByte())
+
+        // COSE_Key map { 1: 2, 3: -7, -1: 1, -2: x, -3: y }
+        val coseKey = cborHead(5, 5) +
+            cborInt(1) + cborInt(2) +
+            cborInt(3) + cborInt(-7) +
+            cborInt(-1) + cborInt(1) +
+            cborInt(-2) + cborBytes(xBytes) +
+            cborInt(-3) + cborBytes(yBytes)
+
+        val authData = rpIdHash + flags + signCount + aaguid + credIdLen + credIdBytes + coseKey
+        // attestationObject CBOR { "fmt": "none", "attStmt": {}, "authData": authData }
+        val attestationObj = cborHead(5, 3) +
+            cborText("fmt") + cborText("none") +
+            cborText("attStmt") + cborHead(5, 0) +
+            cborText("authData") + cborBytes(authData)
+
+        // Queue pending save for vault.db & update immediate cache
+        queuePendingPasskeySave(
+            context = context,
+            title = rpName.ifBlank { rpId },
+            url = "https://$rpId",
+            account = userName,
+            passkey = AutofillPasskey(
+                credentialId = credIdB64,
+                rpId = rpId,
+                rpName = rpName,
+                userId = userIdB64,
+                userName = userName,
+                userDisplayName = userDisplayName,
+                privateKeyJwk = jwk.toString(),
+                publicKeySpki = b64UrlEncode(pub.encoded),
+                signCount = 0
+            )
+        )
+
+        val resp = JSONObject().apply {
+            put("clientDataJSON", b64UrlEncode(clientDataBytes))
+            put("attestationObject", b64UrlEncode(attestationObj))
+            put("transports", JSONArray().put("internal"))
+        }
+        return JSONObject().apply {
+            put("id", credIdB64)
+            put("rawId", credIdB64)
+            put("type", "public-key")
+            put("authenticatorAttachment", "platform")
+            put("response", resp)
+            put("clientExtensionResults", JSONObject())
+        }.toString()
+    }
+
+    fun signPasskeyAndBuildResponseJson(
+        pk: AutofillPasskey,
+        requestJsonStr: String,
+        origin: String,
+        providedClientDataHash: ByteArray?
+    ): String {
+        val req = JSONObject(requestJsonStr)
+        val challengeB64 = req.optString("challenge", "")
+        val rpId = req.optString("rpId", pk.rpId).ifBlank { pk.rpId }
+
+        val clientDataBytes = JSONObject().apply {
+            put("type", "webauthn.get")
+            put("challenge", challengeB64)
+            put("origin", origin)
+            put("crossOrigin", false)
+        }.toString().toByteArray(Charsets.UTF_8)
+
+        val clientDataHash = providedClientDataHash
+            ?: MessageDigest.getInstance("SHA-256").digest(clientDataBytes)
+
+        val nextCount = pk.signCount + 1
+        val rpIdHash = MessageDigest.getInstance("SHA-256").digest(rpId.toByteArray(Charsets.UTF_8))
+        val flags = byteArrayOf(0x05) // UP | UV
+        val signCountBytes = ByteBuffer.allocate(4).putInt(nextCount).array()
+        val authData = rpIdHash + flags + signCountBytes
+
+        val jwk = JSONObject(pk.privateKeyJwk)
+        val dBig = BigInteger(1, b64UrlDecode(jwk.getString("d")))
+        val params = AlgorithmParameters.getInstance("EC").apply {
+            init(ECGenParameterSpec("secp256r1"))
+        }
+        val ecSpec = params.getParameterSpec(ECParameterSpec::class.java)
+        val privKey = KeyFactory.getInstance("EC").generatePrivate(ECPrivateKeySpec(dBig, ecSpec))
+
+        val sig = Signature.getInstance("SHA256withECDSA").apply {
+            initSign(privKey)
+            update(authData + clientDataHash)
+        }.sign()
+
+        val resp = JSONObject().apply {
+            put("clientDataJSON", b64UrlEncode(clientDataBytes))
+            put("authenticatorData", b64UrlEncode(authData))
+            put("signature", b64UrlEncode(sig))
+            if (pk.userId.isNotBlank()) {
+                put("userHandle", pk.userId)
+            }
+        }
+        return JSONObject().apply {
+            put("id", pk.credentialId)
+            put("rawId", pk.credentialId)
+            put("type", "public-key")
+            put("authenticatorAttachment", "platform")
+            put("response", resp)
+            put("clientExtensionResults", JSONObject())
+        }.toString()
+    }
+
+    private fun queuePendingPasskeySave(
+        context: Context,
+        title: String,
+        url: String,
+        account: String,
+        passkey: AutofillPasskey
+    ) {
+        try {
+            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val existingPlain = prefs.getString(KEY_PENDING_SAVES_ENC, null)?.let { decryptString(it) }
+            val arr = if (!existingPlain.isNullOrBlank()) JSONArray(existingPlain) else JSONArray()
+            val pkObj = JSONObject().apply {
+                put("credential_id", passkey.credentialId)
+                put("rp_id", passkey.rpId)
+                put("rp_name", passkey.rpName)
+                put("user_id", passkey.userId)
+                put("user_name", passkey.userName)
+                put("user_display_name", passkey.userDisplayName)
+                put("private_key_jwk", passkey.privateKeyJwk)
+                put("public_key_spki", passkey.publicKeySpki)
+                put("sign_count", passkey.signCount)
+                put("created_at", System.currentTimeMillis() / 1000L)
+            }
+            val item = JSONObject().apply {
+                put("title", title)
+                put("url", url)
+                put("account", account)
+                put("password", "")
+                put("passkey", pkObj)
+            }
+            arr.put(item)
+            prefs.edit().putString(KEY_PENDING_SAVES_ENC, encryptString(arr.toString())).apply()
+
+            // Also update in-memory cache immediately
+            val current = getAllCredentials(context).toMutableList()
+            current.add(
+                AutofillCred(
+                    id = "local-${System.currentTimeMillis()}",
+                    title = title,
+                    account = account,
+                    password = "",
+                    loginUrl = url,
+                    totpSecret = "",
+                    passkeys = listOf(passkey)
+                )
+            )
+            memoryCache = current
+        } catch (e: Throwable) {
+            android.util.Log.w("AccountVaultAutofill", "queuePendingPasskeySave failed", e)
+        }
     }
 }

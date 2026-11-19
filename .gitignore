@@ -1,5 +1,5 @@
-# Logs
-logs
+# ==================== Logs ====================
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -7,31 +7,66 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
+# ==================== Node / Frontend ====================
+node_modules/
+dist/
+dist-ssr/
 *.local
+.env
+.env.*
+*.tsbuildinfo
 
-# Editor directories and files
+# ==================== Rust / Tauri ====================
+src-tauri/target/
+target/
+src-tauri/gen/schemas/
+artifacts/
+release-assets/
+
+# ==================== Android / Gradle ====================
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/.tauri/
+src-tauri/gen/android/**/build/
+src-tauri/gen/android/**/.cxx/
+src-tauri/gen/android/**/.externalNativeBuild/
+src-tauri/gen/android/local.properties
+src-tauri/gen/android/captures/
+src-tauri/gen/android/app/src/main/jniLibs/
+src-tauri/gen/android/app/src/main/**/generated/
+
+# ==================== Packaged Installers & Archives ====================
+*.exe
+*.msi
+*.dmg
+*.AppImage
+*.deb
+*.rpm
+*.apk
+*.aab
+*.crx
+*.zip
+
+# ==================== Extension Keys & Local Vault Data ====================
+*.pem
+*.db
+*.db-wal
+*.db-shm
+*.avault
+*.gvault
+webdav.json
+browser_bridge.json
+hello.bin
+
+# ==================== Editor & OS ====================
 .vscode/*
 !.vscode/extensions.json
-.idea
+.idea/
+*.iml
 .DS_Store
+Thumbs.db
+Desktop.ini
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
-
-# Rust & Tauri
-src-tauri/target/
-target/
-*.exe
-*.apk
-src-tauri/gen/android/.gradle/
-src-tauri/gen/android/**/build/
-src-tauri/gen/android/**/.cxx/
-
-# Browser extension signing key & packages
-*.pem
-*.crx

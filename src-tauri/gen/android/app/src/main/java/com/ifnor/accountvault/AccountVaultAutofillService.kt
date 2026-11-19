@@ -1,8 +1,10 @@
 package com.ifnor.accountvault
 
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.app.assist.AssistStructure
 import android.content.Intent
+import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.CancellationSignal
 import android.service.autofill.AutofillService
@@ -10,6 +12,8 @@ import android.service.autofill.Dataset
 import android.service.autofill.FillCallback
 import android.service.autofill.FillRequest
 import android.service.autofill.FillResponse
+import android.service.autofill.InlinePresentation
+import android.service.autofill.Presentations
 import android.service.autofill.SaveCallback
 import android.service.autofill.SaveInfo
 import android.service.autofill.SaveRequest
@@ -17,8 +21,12 @@ import android.text.InputType
 import android.view.View
 import android.view.autofill.AutofillId
 import android.view.autofill.AutofillValue
+import android.view.inputmethod.InlineSuggestionsRequest
 import android.widget.RemoteViews
+import android.widget.inline.InlinePresentationSpec
 import androidx.annotation.RequiresApi
+import androidx.autofill.inline.UiVersions
+import androidx.autofill.inline.v1.InlineSuggestionUi
 
 @RequiresApi(Build.VERSION_CODES.O)
 class AccountVaultAutofillService : AutofillService() {
@@ -29,6 +37,7 @@ class AccountVaultAutofillService : AutofillService() {
         val usernameIds: MutableList<AutofillId> = mutableListOf(),
         val passwordIds: MutableList<AutofillId> = mutableListOf(),
         val otpIds: MutableList<AutofillId> = mutableListOf(),
+        val focusedFallbackIds: MutableList<AutofillId> = mutableListOf(),
         var lastUsernameValue: String = "",
         var lastPasswordValue: String = ""
     )
@@ -47,34 +56,64 @@ class AccountVaultAutofillService : AutofillService() {
         val structure = contexts.last().structure
         val parsed = parseStructure(structure)
 
-        // Avoid offering autofill on AccountVault itself
         if (parsed.packageName == packageName) {
             callback.onSuccess(null)
             return
         }
 
+        // Focused field fallback for custom/non-standard App inputs
         if (parsed.usernameIds.isEmpty() && parsed.passwordIds.isEmpty() && parsed.otpIds.isEmpty()) {
-            callback.onSuccess(null)
-            return
+            if (parsed.focusedFallbackIds.isNotEmpty()) {
+                parsed.usernameIds.addAll(parsed.focusedFallbackIds)
+            } else {
+                callback.onSuccess(null)
+                return
+            }
         }
+
+        val inlineRequest: InlineSuggestionsRequest? =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) request.inlineSuggestionsRequest else null
+        val inlineSpecs =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) inlineRequest?.inlinePresentationSpecs ?: emptyList()
+            else emptyList()
+        val maxInlineCount =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) inlineRequest?.maxSuggestionCount ?: 0
+            else 0
+        var inlineIndex = 0
+        var reqCodeSeq = 2000
 
         val responseBuilder = FillResponse.Builder()
         val matched = AutofillCredentialStore.matchCredentials(this, parsed.webDomain, parsed.packageName)
         val allCreds = AutofillCredentialStore.getAllCredentials(this)
 
         var datasetCount = 0
-        for (cred in matched.take(6)) {
-            buildDataset(cred, parsed)?.let {
+        for (cred in matched.take(5)) {
+            val inlineSpec = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && inlineIndex < maxInlineCount && inlineSpecs.isNotEmpty()) {
+                inlineSpecs[inlineIndex.coerceAtMost(inlineSpecs.size - 1)]
+            } else {
+                null
+            }
+            val inlinePres = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && inlineSpec != null) {
+                buildInlinePresentation(
+                    cred.title.ifBlank { cred.loginUrl.ifBlank { "AccountVault" } },
+                    cred.account.ifBlank { "填充密码" },
+                    inlineSpec,
+                    reqCodeSeq++
+                )
+            } else {
+                null
+            }
+            buildDataset(cred, parsed, inlinePres)?.let {
                 responseBuilder.addDataset(it)
                 datasetCount++
+                if (inlinePres != null) inlineIndex++
             }
         }
 
-        // Always add a picker dataset so user can search/pick any account or unlock if empty
-        val pickerTitle = if (allCreds.isEmpty()) "打开 AccountVault 解锁并填充" else "从 AccountVault 选择账号…"
+        val pickerTitle = if (allCreds.isEmpty()) "解锁 AccountVault" else "选择 AccountVault 账号"
         val pickerSubtitle = parsed.webDomain?.takeIf { it.isNotBlank() }
             ?: parsed.packageName?.substringAfterLast('.')
-            ?: "搜索全部已保存账号"
+            ?: "搜索全部账号"
 
         val pickerIntent = Intent(this, AutofillPickerActivity::class.java).apply {
             putParcelableArrayListExtra("usernameIds", ArrayList(parsed.usernameIds))
@@ -89,13 +128,25 @@ class AccountVaultAutofillService : AutofillService() {
         val sender = PendingIntent.getActivity(this, 1001, pickerIntent, piFlags)
 
         val pickerView = makePresentation(pickerTitle, pickerSubtitle)
-        val pickerDatasetBuilder = Dataset.Builder(pickerView)
+        val pickerInlineSpec = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && inlineIndex < maxInlineCount && inlineSpecs.isNotEmpty()) {
+            inlineSpecs[inlineIndex.coerceAtMost(inlineSpecs.size - 1)]
+        } else {
+            null
+        }
+        val pickerInlinePres = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && pickerInlineSpec != null) {
+            buildInlinePresentation(pickerTitle, pickerSubtitle, pickerInlineSpec, reqCodeSeq++)
+        } else {
+            null
+        }
+
+        val pickerDatasetBuilder = createDatasetBuilder(pickerView, pickerInlinePres)
             .setAuthentication(sender.intentSender)
 
         val anchorId = parsed.usernameIds.firstOrNull()
             ?: parsed.passwordIds.firstOrNull()
             ?: parsed.otpIds.firstOrNull()
         if (anchorId != null) {
+            @Suppress("DEPRECATION")
             pickerDatasetBuilder.setValue(anchorId, null)
             responseBuilder.addDataset(pickerDatasetBuilder.build())
             datasetCount++
@@ -106,7 +157,6 @@ class AccountVaultAutofillService : AutofillService() {
             return
         }
 
-        // Attach SaveInfo when password or username+password fields are present
         val saveIds = mutableListOf<AutofillId>()
         parsed.usernameIds.firstOrNull()?.let { saveIds.add(it) }
         parsed.passwordIds.firstOrNull()?.let { saveIds.add(it) }
@@ -142,11 +192,64 @@ class AccountVaultAutofillService : AutofillService() {
         callback.onSuccess()
     }
 
-    private fun buildDataset(cred: AutofillCred, parsed: ParsedFields): Dataset? {
+    @SuppressLint("RestrictedApi")
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun buildInlinePresentation(
+        title: String,
+        subtitle: String,
+        spec: InlinePresentationSpec,
+        requestCode: Int
+    ): InlinePresentation? {
+        return try {
+            val styles = spec.style
+            if (!UiVersions.getVersions(styles).contains(UiVersions.INLINE_UI_VERSION_1)) {
+                return null
+            }
+            val attributionIntent = PendingIntent.getActivity(
+                this,
+                requestCode,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val content = InlineSuggestionUi.newContentBuilder(attributionIntent)
+                .setTitle(title)
+                .setSubtitle(subtitle)
+                .setStartIcon(Icon.createWithResource(this, R.mipmap.ic_launcher_round))
+                .build()
+            InlinePresentation(content.slice, spec, false)
+        } catch (e: Throwable) {
+            android.util.Log.w("AccountVaultAutofill", "buildInlinePresentation failed", e)
+            null
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun createDatasetBuilder(menuView: RemoteViews, inlinePres: InlinePresentation?): Dataset.Builder {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val presBuilder = Presentations.Builder().setMenuPresentation(menuView)
+            if (inlinePres != null) {
+                presBuilder.setInlinePresentation(inlinePres)
+            }
+            Dataset.Builder(presBuilder.build())
+        } else {
+            val builder = Dataset.Builder(menuView)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && inlinePres != null) {
+                builder.setInlinePresentation(inlinePres)
+            }
+            builder
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun buildDataset(
+        cred: AutofillCred,
+        parsed: ParsedFields,
+        inlinePres: InlinePresentation?
+    ): Dataset? {
         val title = cred.title.ifBlank { cred.loginUrl.ifBlank { "AccountVault" } }
         val subtitle = cred.account.ifBlank { "点击填充密码" }
         val presentation = makePresentation(title, subtitle)
-        val builder = Dataset.Builder(presentation)
+        val builder = createDatasetBuilder(presentation, inlinePres)
         var hasValue = false
 
         if (cred.account.isNotBlank()) {
@@ -250,6 +353,9 @@ class AccountVaultAutofillService : AutofillService() {
                 isUsername -> {
                     parsed.usernameIds.add(autofillId)
                     if (textVal.isNotEmpty()) parsed.lastUsernameValue = textVal
+                }
+                node.isFocused && node.autofillType == View.AUTOFILL_TYPE_TEXT -> {
+                    parsed.focusedFallbackIds.add(autofillId)
                 }
             }
         }

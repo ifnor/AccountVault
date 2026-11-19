@@ -2,21 +2,31 @@ package com.ifnor.accountvault
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.autofill.AutofillManager
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.annotation.Keep
 import androidx.core.content.FileProvider
+import androidx.core.view.WindowCompat
 import java.io.File
 
 @Keep
 class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
-    enableEdgeToEdge()
+    enableEdgeToEdge(
+      statusBarStyle = SystemBarStyle.light(Color.WHITE, Color.WHITE),
+      navigationBarStyle = SystemBarStyle.light(Color.WHITE, Color.WHITE)
+    )
     super.onCreate(savedInstanceState)
+    WindowCompat.getInsetsController(window, window.decorView).apply {
+      isAppearanceLightStatusBars = true
+      isAppearanceLightNavigationBars = true
+    }
     instance = this
   }
 
@@ -172,8 +182,15 @@ class MainActivity : TauriActivity() {
         targetContext.startActivity(intent)
         true
       } catch (e: Throwable) {
-        android.util.Log.w("AccountVault", "openAutofillSettings failed", e)
-        false
+        android.util.Log.w("AccountVault", "openAutofillSettings failed, falling back to ACTION_SETTINGS", e)
+        try {
+          targetContext.startActivity(Intent(Settings.ACTION_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          })
+          true
+        } catch (_: Throwable) {
+          false
+        }
       }
     }
 

@@ -218,16 +218,23 @@ export async function generateTotp(rawSecret) {
   if (!rawSecret || !rawSecret.trim()) return { code: "", remaining: 0 };
   try {
     let secret = rawSecret.trim();
+    let isHotp = false;
+    let hotpCounter = 0;
     if (secret.toLowerCase().startsWith("otpauth://")) {
+      isHotp = secret.toLowerCase().startsWith("otpauth://hotp/");
       const m = secret.match(/[?&]secret=([^&]+)/i);
       if (m) secret = decodeURIComponent(m[1]);
+      if (isHotp) {
+        const cm = rawSecret.trim().match(/[?&]counter=(\d+)/i);
+        hotpCounter = cm ? parseInt(cm[1], 10) : 0;
+      }
     }
     const keyBytes = decodeBase32(secret);
     if (keyBytes.length === 0) return { code: "", remaining: 0 };
 
     const nowSec = Math.floor(Date.now() / 1000);
-    const step = Math.floor(nowSec / 30);
-    const remaining = 30 - (nowSec % 30);
+    const step = isHotp ? hotpCounter : Math.floor(nowSec / 30);
+    const remaining = isHotp ? 0 : 30 - (nowSec % 30);
 
     const msg = new Uint8Array(8);
     const dv = new DataView(msg.buffer);

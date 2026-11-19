@@ -90,6 +90,25 @@ interface AccountRecord {
 interface TotpResult {
   code: string;
   remaining_seconds: number;
+  otp_type?: "totp" | "hotp" | string;
+  counter?: number;
+}
+
+async function handleIncrementHotp(id: string) {
+  try {
+    const updated = await invoke<AccountRecord>("increment_hotp_counter", { id });
+    const idx = records.value.findIndex((r) => r.id === id);
+    if (idx >= 0) {
+      records.value[idx] = updated;
+    }
+    if (updated.totp) {
+      const res = await invoke<TotpResult>("get_totp", { secret: updated.totp });
+      totpMap.value = { ...totpMap.value, [id]: res };
+    }
+    notify("已生成下一位 HOTP 动态码", "success", 1500);
+  } catch (e: any) {
+    notify(`更新 HOTP 计数失败: ${e}`, "error");
+  }
 }
 
 interface TotpQrResult {
@@ -167,29 +186,57 @@ function getRecordDomain(r: AccountRecord): string {
   return "";
 }
 
-const faviconFallbackStage = ref<Record<string, number>>({});
+const faviconDataCache = ref<Record<string, string>>({});
+const faviconFetchingSet = new Set<string>();
+const faviconFailedSet = new Set<string>();
+
+async function loadCachedFavicons() {
+  try {
+    const map = await invoke<Record<string, string>>("get_cached_favicons");
+    if (map && typeof map === "object") {
+      faviconDataCache.value = map;
+    }
+  } catch (_) {}
+}
+
+function queueFaviconFetch(domain: string) {
+  if (!domain || faviconFetchingSet.has(domain) || faviconFailedSet.has(domain)) return;
+  faviconFetchingSet.add(domain);
+  invoke<string | null>("fetch_and_cache_favicon", { domain })
+    .then((dataUrl) => {
+      if (dataUrl) {
+        faviconDataCache.value = {
+          ...faviconDataCache.value,
+          [domain]: dataUrl,
+        };
+      } else {
+        faviconFailedSet.add(domain);
+      }
+    })
+    .catch(() => {
+      faviconFailedSet.add(domain);
+    })
+    .finally(() => {
+      faviconFetchingSet.delete(domain);
+    });
+}
 
 function getFaviconUrl(r: AccountRecord): string | null {
   const domain = getRecordDomain(r);
   if (!domain) return null;
-  const stage = faviconFallbackStage.value[domain] || 0;
-  if (stage === 0) {
-    return `https://icons.duckduckgo.com/ip3/${encodeURIComponent(domain)}.ico`;
-  }
-  if (stage === 1) {
-    return `https://${domain}/favicon.ico`;
-  }
+  const cached = faviconDataCache.value[domain];
+  if (cached) return cached;
+  queueFaviconFetch(domain);
   return null;
 }
 
 function handleFaviconError(r: AccountRecord) {
   const domain = getRecordDomain(r);
   if (!domain) return;
-  const cur = faviconFallbackStage.value[domain] || 0;
-  faviconFallbackStage.value = {
-    ...faviconFallbackStage.value,
-    [domain]: cur + 1
-  };
+  faviconFailedSet.add(domain);
+  const next = { ...faviconDataCache.value };
+  delete next[domain];
+  faviconDataCache.value = next;
 }
 
 // App State
@@ -719,9 +766,31 @@ function hasUnusedBackupCodes(r: AccountRecord): boolean {
   return codes.some((c) => !usedSet.has(c));
 }
 
-const homeTab = ref<"totp" | "passwords" | "passkeys">("passwords");
+type HomeTabType = "totp" | "passwords" | "passkeys";
 
-function switchHomeTab(tab: "totp" | "passwords" | "passkeys") {
+function loadDefaultHomeTab(): HomeTabType {
+  try {
+    const saved = localStorage.getItem("avault_default_home_tab");
+    if (saved === "totp" || saved === "passwords" || saved === "passkeys") {
+      return saved;
+    }
+  } catch (_) {}
+  return "totp";
+}
+
+const defaultHomeTab = ref<HomeTabType>(loadDefaultHomeTab());
+const homeTab = ref<HomeTabType>(defaultHomeTab.value);
+
+function setDefaultHomeTab(tab: HomeTabType) {
+  defaultHomeTab.value = tab;
+  try {
+    localStorage.setItem("avault_default_home_tab", tab);
+  } catch (_) {}
+  const label = tab === "totp" ? "OTP" : tab === "passwords" ? "密码" : "PassKey";
+  notify(`已将默认启动页设为：${label}`, "success");
+}
+
+function switchHomeTab(tab: HomeTabType) {
   homeTab.value = tab;
   if (typeof window !== "undefined" && window.innerWidth < 768) {
     mobileView.value = "list";
@@ -2877,6 +2946,61 @@ function handleWindowFocus() {
 
 let syncIntervalTimer: any = null;
 
+// ==================== PULL TO REFRESH ====================
+const listScrollRef = ref<HTMLElement | null>(null);
+const pullDistance = ref(0);
+const isPullRefreshing = ref(false);
+let pullStartY = 0;
+let isPullTracking = false;
+
+function onListTouchStart(e: TouchEvent) {
+  if (isPullRefreshing.value) return;
+  const el = listScrollRef.value;
+  if (!el || el.scrollTop > 2) return;
+  pullStartY = e.touches[0]?.clientY || 0;
+  isPullTracking = true;
+}
+
+function onListTouchMove(e: TouchEvent) {
+  if (!isPullTracking || isPullRefreshing.value) return;
+  const el = listScrollRef.value;
+  if (!el || el.scrollTop > 2) {
+    isPullTracking = false;
+    pullDistance.value = 0;
+    return;
+  }
+  const dy = (e.touches[0]?.clientY || 0) - pullStartY;
+  if (dy > 0) {
+    pullDistance.value = Math.min(84, Math.round(dy * 0.48));
+  } else {
+    pullDistance.value = 0;
+  }
+}
+
+async function onListTouchEnd() {
+  if (!isPullTracking) return;
+  isPullTracking = false;
+  if (pullDistance.value >= 52 && !isPullRefreshing.value) {
+    isPullRefreshing.value = true;
+    pullDistance.value = 44;
+    try {
+      if (webdavForm.value.url) {
+        await triggerSmartSync(false);
+      } else {
+        records.value = await invoke<AccountRecord[]>("get_records");
+        await loadCachedFavicons();
+        notify("已刷新本地账号列表", "success", 1500);
+      }
+    } catch (_) {
+    } finally {
+      isPullRefreshing.value = false;
+      pullDistance.value = 0;
+    }
+  } else {
+    pullDistance.value = 0;
+  }
+}
+
 onMounted(async () => {
   try {
     const { getVersion } = await import("@tauri-apps/api/app");
@@ -2890,6 +3014,7 @@ onMounted(async () => {
   }
   await refreshSecurityStatus();
   await refreshAutofillAndBridgeStatus();
+  await loadCachedFavicons();
   await setupBackNavigation();
   try {
     unlistenRecordsUpdated = await listen("vault-records-updated", async () => {
@@ -2976,7 +3101,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="h-screen w-screen flex flex-col bg-[#f8fafd] select-none text-[#1f1f1f] font-sans antialiased overflow-hidden pt-[env(safe-area-inset-top,0px)] pb-[env(safe-area-inset-bottom,0px)]">
+  <div @contextmenu.prevent class="h-screen w-screen flex flex-col bg-white select-none text-[#1f1f1f] font-sans antialiased overflow-hidden pt-[env(safe-area-inset-top,0px)] pb-[env(safe-area-inset-bottom,0px)]">
     
     <!-- 1. LOCK / UNLOCK SCREEN -->
     <div v-if="!isUnlocked" class="flex-1 flex items-center justify-center p-6 relative">
@@ -3452,7 +3577,23 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div class="flex-1 overflow-y-auto px-2.5 py-2 space-y-1.5 pb-24" @click.self="selectedId = null">
+          <div
+            ref="listScrollRef"
+            @touchstart.passive="onListTouchStart"
+            @touchmove.passive="onListTouchMove"
+            @touchend="onListTouchEnd"
+            class="flex-1 overflow-y-auto px-2.5 py-2 space-y-1.5 pb-24"
+            @click.self="selectedId = null"
+          >
+            <!-- Pull-to-Refresh Indicator -->
+            <div
+              v-if="pullDistance > 0 || isPullRefreshing"
+              class="flex items-center justify-center gap-2 text-xs font-medium text-[#1a73e8] overflow-hidden transition-all duration-150"
+              :style="{ height: `${pullDistance}px` }"
+            >
+              <RefreshCw class="w-3.5 h-3.5" :class="{ 'animate-spin': isPullRefreshing }" />
+              <span>{{ isPullRefreshing ? '正在同步刷新...' : pullDistance >= 52 ? '松手立即刷新' : '下拉刷新列表' }}</span>
+            </div>
             <div
               v-for="r in filteredRecords"
               :key="r.id"
@@ -3544,10 +3685,18 @@ onUnmounted(() => {
                   </span>
                 </div>
 
-                <!-- TOTP Tab trailing info -->
+                <!-- TOTP / HOTP Tab trailing info -->
                 <div v-else-if="homeTab === 'totp'" class="flex flex-col items-end">
                   <div class="flex items-center gap-1.5 font-mono text-base font-extrabold tracking-wider text-[#1a73e8]">
                     <span>{{ totpMap[r.id]?.code || "••••••" }}</span>
+                    <button
+                      v-if="totpMap[r.id]?.otp_type === 'hotp'"
+                      @click.stop="handleIncrementHotp(r.id)"
+                      class="p-1 rounded-lg hover:bg-[#e8f0fe] text-[#1a73e8] cursor-pointer"
+                      title="生成下一位 HOTP 验证码 (+1)"
+                    >
+                      <RefreshCw class="w-3.5 h-3.5" />
+                    </button>
                     <button
                       @click.stop="copyText(totpMap[r.id]?.code || '', r.id + '-totp')"
                       class="p-1 rounded-lg hover:bg-[#e8f0fe] text-[#5f6368] hover:text-[#1a73e8] cursor-pointer"
@@ -3557,7 +3706,10 @@ onUnmounted(() => {
                       <Copy v-else class="w-3.5 h-3.5" />
                     </button>
                   </div>
-                  <span class="text-[10px] text-[#80868b] font-mono">{{ totpMap[r.id]?.remaining_seconds || 30 }}s 剩余</span>
+                  <span v-if="totpMap[r.id]?.otp_type === 'hotp'" class="text-[10px] text-indigo-600 font-mono">
+                    HOTP · #{{ totpMap[r.id]?.counter ?? 0 }}
+                  </span>
+                  <span v-else class="text-[10px] text-[#80868b] font-mono">{{ totpMap[r.id]?.remaining_seconds || 30 }}s 剩余</span>
                 </div>
 
                 <!-- Passwords Tab trailing info -->
@@ -3885,14 +4037,17 @@ onUnmounted(() => {
               </div>
             </div>
 
-            <!-- TOTP Card -->
+            <!-- TOTP / HOTP Card -->
             <div class="bg-[#edf2fa] rounded-2xl p-3 border border-[#d3e3fd]/80">
               <div class="flex items-center justify-between mb-1.5">
                 <span class="text-xs font-bold text-[#444746] flex items-center gap-1.5">
                   <Clock class="w-3.5 h-3.5 text-[#1a73e8]" />
-                  2FA 动态安全码 (TOTP)
+                  {{ totpMap[selectedRecord.id]?.otp_type === 'hotp' ? '2FA 动态安全码 (HOTP)' : '2FA 动态安全码 (TOTP)' }}
                 </span>
-                <span class="text-[11px] font-mono text-[#5f6368]">{{ totpMap[selectedRecord.id]?.remaining_seconds || 30 }}s 后刷新</span>
+                <span v-if="totpMap[selectedRecord.id]?.otp_type === 'hotp'" class="text-[11px] font-mono text-indigo-600 font-semibold">
+                  计数器 #{{ totpMap[selectedRecord.id]?.counter ?? 0 }}
+                </span>
+                <span v-else class="text-[11px] font-mono text-[#5f6368]">{{ totpMap[selectedRecord.id]?.remaining_seconds || 30 }}s 后刷新</span>
               </div>
 
               <div class="flex items-center justify-between my-1">
@@ -3901,6 +4056,16 @@ onUnmounted(() => {
                 </div>
                 <div v-if="selectedRecord.totp" class="flex items-center gap-1.5">
                   <button
+                    v-if="totpMap[selectedRecord.id]?.otp_type === 'hotp'"
+                    type="button"
+                    @click="handleIncrementHotp(selectedRecord.id)"
+                    class="px-2.5 py-1 bg-white hover:bg-[#e8f0fe] text-[#1a73e8] border border-[#1a73e8]/30 rounded-xl text-xs font-medium flex items-center gap-1 shadow-2xs cursor-pointer"
+                  >
+                    <RefreshCw class="w-3.5 h-3.5" />
+                    <span>下一位</span>
+                  </button>
+                  <button
+                    v-else
                     type="button"
                     @click="openTotpQrModal(selectedRecord)"
                     class="px-2 py-1 bg-white hover:bg-[#e8f0fe] text-[#1a73e8] border border-[#1a73e8]/30 rounded-xl text-xs font-medium flex items-center gap-1 shadow-2xs cursor-pointer"
@@ -4023,12 +4188,12 @@ onUnmounted(() => {
       <!-- FLOATING LIQUID GLASS BOTTOM PILL TAB BAR (Windows & Android) -->
       <div
         :class="[
-          'fixed bottom-4 left-1/2 -translate-x-1/2 z-30 pointer-events-none',
+          'fixed bottom-5 md:bottom-4 left-1/2 -translate-x-1/2 z-30 pointer-events-none',
           mobileView === 'detail' ? 'hidden md:block' : 'block'
         ]"
       >
         <nav
-          class="pointer-events-auto w-[246px] sm:w-[276px] bg-white/65 backdrop-blur-2xl border border-white/85 ring-1 ring-slate-900/5 shadow-[0_12px_36px_rgba(15,23,42,0.14),inset_0_1px_1px_rgba(255,255,255,0.95)] rounded-full p-1"
+          class="pointer-events-auto w-[274px] md:w-[276px] bg-white/65 backdrop-blur-2xl border border-white/85 ring-1 ring-slate-900/5 shadow-[0_12px_36px_rgba(15,23,42,0.14),inset_0_1px_1px_rgba(255,255,255,0.95)] rounded-full p-1.5 md:p-1"
           aria-label="主导航"
         >
           <div class="relative grid grid-cols-3 items-center">
@@ -4049,23 +4214,23 @@ onUnmounted(() => {
               type="button"
               @click="switchHomeTab('totp')"
               :class="[
-                'relative z-10 h-9 rounded-full text-xs font-semibold flex items-center justify-center gap-1 transition-all duration-200 active:scale-95 cursor-pointer whitespace-nowrap',
+                'relative z-10 h-11 md:h-9 rounded-full text-[13px] md:text-xs font-semibold flex items-center justify-center gap-1.5 md:gap-1 transition-all duration-200 active:scale-95 cursor-pointer whitespace-nowrap',
                 homeTab === 'totp' ? 'text-white' : 'text-slate-600 hover:text-slate-900'
               ]"
             >
-              <Clock class="w-3.5 h-3.5 transition-transform duration-200" :class="homeTab === 'totp' ? 'scale-110' : ''" />
-              <span>TOTP</span>
+              <Clock class="w-4 h-4 md:w-3.5 md:h-3.5 transition-transform duration-200" :class="homeTab === 'totp' ? 'scale-110' : ''" />
+              <span>OTP</span>
             </button>
 
             <button
               type="button"
               @click="switchHomeTab('passwords')"
               :class="[
-                'relative z-10 h-9 rounded-full text-xs font-semibold flex items-center justify-center gap-1 transition-all duration-200 active:scale-95 cursor-pointer whitespace-nowrap',
+                'relative z-10 h-11 md:h-9 rounded-full text-[13px] md:text-xs font-semibold flex items-center justify-center gap-1.5 md:gap-1 transition-all duration-200 active:scale-95 cursor-pointer whitespace-nowrap',
                 homeTab === 'passwords' ? 'text-white' : 'text-slate-600 hover:text-slate-900'
               ]"
             >
-              <KeyRound class="w-3.5 h-3.5 transition-transform duration-200" :class="homeTab === 'passwords' ? 'scale-110' : ''" />
+              <KeyRound class="w-4 h-4 md:w-3.5 md:h-3.5 transition-transform duration-200" :class="homeTab === 'passwords' ? 'scale-110' : ''" />
               <span>密码</span>
             </button>
 
@@ -4073,11 +4238,11 @@ onUnmounted(() => {
               type="button"
               @click="switchHomeTab('passkeys')"
               :class="[
-                'relative z-10 h-9 rounded-full text-xs font-semibold flex items-center justify-center gap-1 transition-all duration-200 active:scale-95 cursor-pointer whitespace-nowrap',
+                'relative z-10 h-11 md:h-9 rounded-full text-[13px] md:text-xs font-semibold flex items-center justify-center gap-1.5 md:gap-1 transition-all duration-200 active:scale-95 cursor-pointer whitespace-nowrap',
                 homeTab === 'passkeys' ? 'text-white' : 'text-slate-600 hover:text-slate-900'
               ]"
             >
-              <Fingerprint class="w-3.5 h-3.5 transition-transform duration-200" :class="homeTab === 'passkeys' ? 'scale-110' : ''" />
+              <Fingerprint class="w-4 h-4 md:w-3.5 md:h-3.5 transition-transform duration-200" :class="homeTab === 'passkeys' ? 'scale-110' : ''" />
               <span>PassKey</span>
             </button>
           </div>
@@ -4654,6 +4819,33 @@ onUnmounted(() => {
                   <span :class="['inline-block h-5 w-5 transform rounded-full bg-white shadow transition', showListAvatar ? 'translate-x-5' : 'translate-x-0']" />
                 </button>
               </div>
+
+              <div class="pt-3 border-t border-[#dadce0]/60 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                <div>
+                  <h3 class="text-xs font-bold text-[#202124]">默认启动页（首页）</h3>
+                  <p class="text-[11px] text-[#5f6368] mt-0.5">设置解锁后默认进入的底部标签页（默认为 OTP）。</p>
+                </div>
+                <div class="flex items-center gap-1.5 flex-shrink-0">
+                  <button
+                    v-for="item in ([
+                      { key: 'totp', label: 'OTP' },
+                      { key: 'passwords', label: '密码' },
+                      { key: 'passkeys', label: 'PassKey' }
+                    ] as const)"
+                    :key="item.key"
+                    type="button"
+                    @click="setDefaultHomeTab(item.key)"
+                    :class="[
+                      'px-3 py-1 rounded-lg text-[11px] font-medium border cursor-pointer transition-colors',
+                      defaultHomeTab === item.key
+                        ? 'bg-[#1a73e8] text-white border-[#1a73e8]'
+                        : 'bg-white text-[#5f6368] border-[#dadce0] hover:bg-[#f1f3f4]'
+                    ]"
+                  >
+                    {{ item.label }}
+                  </button>
+                </div>
+              </div>
             </div>
 
             <div class="p-3.5 sm:p-4 bg-[#f8fafd] rounded-2xl border border-[#dadce0] space-y-3">
@@ -5031,7 +5223,7 @@ onUnmounted(() => {
     </div>
 
     <!-- TOAST NOTIFICATIONS -->
-    <div class="fixed top-6 left-1/2 -translate-x-1/2 z-[9999] pointer-events-none flex flex-col gap-2.5 items-center max-w-lg w-full px-4">
+    <div class="fixed top-[calc(max(env(safe-area-inset-top,0px),38px)+16px)] md:top-5 left-1/2 -translate-x-1/2 z-[9999] pointer-events-none flex flex-col gap-2.5 items-center max-w-lg w-full px-4">
       <div
         v-for="toast in toasts"
         :key="toast.id"
@@ -5156,10 +5348,6 @@ onUnmounted(() => {
             <div>{{ quickScanCameraError || '正在请求摄像头权限...' }}</div>
           </div>
         </div>
-
-        <p class="text-[11px] text-slate-500 text-center">
-          支持扫描 <code class="px-1 py-0.5 bg-slate-100 rounded">otpauth://</code> 2FA 二维码或 PassKey 配置二维码；也可直接按 <kbd class="px-1.5 py-0.5 bg-slate-100 rounded border border-slate-200">Ctrl+V</kbd> 粘贴截图。
-        </p>
 
         <div class="flex items-center justify-end gap-2 pt-1">
           <button type="button" @click="triggerQuickScanImage" class="px-4 py-2 bg-[#1a73e8] hover:bg-[#1557b0] text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 cursor-pointer">

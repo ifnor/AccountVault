@@ -99,6 +99,14 @@ pub struct VaultSettings {
 pub struct TotpResult {
     pub code: String,
     pub remaining_seconds: u64,
+    #[serde(default = "default_totp_type")]
+    pub otp_type: String,
+    #[serde(default)]
+    pub counter: u64,
+}
+
+fn default_totp_type() -> String {
+    "totp".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
