@@ -37,7 +37,6 @@ import {
   MoreVertical,
   Zap,
   Shield,
-  ArrowUpDown,
   Star,
   CheckSquare,
   Square,
@@ -662,39 +661,6 @@ type SortRule = "alphabetical" | "updated_desc" | "created_desc";
 
 const sortRule = ref<SortRule>((localStorage.getItem("avault_sort_rule") as SortRule) || "alphabetical");
 
-function setSortRule(rule: SortRule) {
-  sortRule.value = rule;
-  try {
-    localStorage.setItem("avault_sort_rule", rule);
-  } catch (e) {}
-}
-
-const sortRuleLabel = computed(() => {
-  switch (sortRule.value) {
-    case "alphabetical":
-      return "按名称 (A-Z)";
-    case "updated_desc":
-      return "按更新时间";
-    case "created_desc":
-      return "按添加时间";
-    default:
-      return "按名称 (A-Z)";
-  }
-});
-
-function cycleSortRule() {
-  if (sortRule.value === "alphabetical") {
-    setSortRule("updated_desc");
-    notify("已切换为：按更新时间排序 (最近修改优先)", "info", 1800);
-  } else if (sortRule.value === "updated_desc") {
-    setSortRule("created_desc");
-    notify("已切换为：按添加时间排序 (最新录入优先)", "info", 1800);
-  } else {
-    setSortRule("alphabetical");
-    notify("已切换为：按平台/账号名称排序 (A-Z，固定不跳动)", "info", 1800);
-  }
-}
-
 // ==================== MULTI-ATTRIBUTE FILTERING ====================
 const showFilterPanel = ref(false);
 const attrFilter = ref({
@@ -897,31 +863,12 @@ const batchTargetGroup = ref("");
 const batchTargetStatus = ref("正常");
 const batchTargetPlan = ref("");
 
-function toggleBatchSelectMode() {
-  isBatchSelectMode.value = !isBatchSelectMode.value;
-  selectedBatchIds.value = [];
-}
-
 function toggleSelectBatchItem(id: string) {
   const idx = selectedBatchIds.value.indexOf(id);
   if (idx >= 0) {
     selectedBatchIds.value.splice(idx, 1);
   } else {
     selectedBatchIds.value.push(id);
-  }
-}
-
-const isAllFilteredSelected = computed(() => {
-  if (filteredRecords.value.length === 0) return false;
-  const set = new Set(selectedBatchIds.value);
-  return filteredRecords.value.every((r) => set.has(r.id));
-});
-
-function toggleSelectAllFiltered() {
-  if (isAllFilteredSelected.value) {
-    selectedBatchIds.value = [];
-  } else {
-    selectedBatchIds.value = filteredRecords.value.map((r) => r.id);
   }
 }
 
@@ -1225,6 +1172,222 @@ function handleTotpPaste(e: ClipboardEvent) {
   }
 }
 
+// ==================== TOP BAR QUICK SCAN (TOTP / PASSKEY) ====================
+const showQuickScanModal = ref(false);
+const quickScanVideoRef = ref<HTMLVideoElement | null>(null);
+const quickScanCameraActive = ref(false);
+const quickScanCameraError = ref("");
+let quickScanStream: MediaStream | null = null;
+let quickScanRafId: number | null = null;
+
+function stopQuickScanCamera() {
+  if (quickScanRafId !== null) {
+    cancelAnimationFrame(quickScanRafId);
+    quickScanRafId = null;
+  }
+  if (quickScanStream) {
+    quickScanStream.getTracks().forEach((t) => t.stop());
+    quickScanStream = null;
+  }
+  quickScanCameraActive.value = false;
+}
+
+function closeQuickScanModal() {
+  stopQuickScanCamera();
+  showQuickScanModal.value = false;
+}
+
+async function startQuickScanCamera() {
+  stopQuickScanCamera();
+  quickScanCameraError.value = "";
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    quickScanCameraError.value = "当前环境不支持直接调用摄像头，请使用下方“选择图片”或 Ctrl+V 粘贴截图";
+    return;
+  }
+  try {
+    quickScanStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" },
+    });
+    quickScanCameraActive.value = true;
+    setTimeout(() => {
+      const video = quickScanVideoRef.value;
+      if (!video || !quickScanStream) return;
+      video.srcObject = quickScanStream;
+      video.play().catch(() => {});
+
+      const canvas = document.createElement("canvas");
+      const tick = () => {
+        if (!showQuickScanModal.value || !quickScanCameraActive.value) return;
+        if (video.readyState === video.HAVE_ENOUGH_DATA && video.videoWidth > 0) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          const ctx = canvas.getContext("2d");
+          if (ctx) {
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQR(imgData.data, imgData.width, imgData.height);
+            if (code && code.data) {
+              handleQuickScannedQr(code.data);
+              return;
+            }
+          }
+        }
+        quickScanRafId = requestAnimationFrame(tick);
+      };
+      quickScanRafId = requestAnimationFrame(tick);
+    }, 80);
+  } catch (e: any) {
+    quickScanCameraActive.value = false;
+    quickScanCameraError.value = "未能打开摄像头（无设备或未授权），可直接选择图片或 Ctrl+V 粘贴二维码截图";
+  }
+}
+
+function openQuickScanModal() {
+  showQuickScanModal.value = true;
+  startQuickScanCamera();
+}
+
+function triggerQuickScanImage() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "image/*";
+  input.onchange = (e: any) => {
+    const file = e.target?.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imageData.data, imageData.width, imageData.height);
+        if (code && code.data) {
+          handleQuickScannedQr(code.data);
+        } else {
+          notify("未能在图片中识别到有效二维码", "warning");
+        }
+      };
+      img.src = String(ev.target?.result || "");
+    };
+    reader.readAsDataURL(file);
+  };
+  input.click();
+}
+
+function handleQuickScanPaste(e: ClipboardEvent) {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].type.startsWith("image/")) {
+      const file = items[i].getAsFile();
+      if (file) {
+        e.preventDefault();
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const img = new Image();
+          img.onload = () => {
+            const canvas = document.createElement("canvas");
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext("2d");
+            if (!ctx) return;
+            ctx.drawImage(img, 0, 0);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQR(imageData.data, imageData.width, imageData.height);
+            if (code && code.data) {
+              handleQuickScannedQr(code.data);
+            } else {
+              notify("粘贴的截图中未识别到有效二维码", "warning");
+            }
+          };
+          img.src = String(ev.target?.result || "");
+        };
+        reader.readAsDataURL(file);
+        return;
+      }
+    }
+  }
+}
+
+async function handleQuickScannedQr(raw: string) {
+  const text = (raw || "").trim();
+  if (!text) return;
+  closeQuickScanModal();
+
+  // 1. TOTP otpauth:// URI
+  if (text.toLowerCase().startsWith("otpauth://")) {
+    try {
+      const urlObj = new URL(text);
+      const rawLabel = decodeURIComponent(urlObj.pathname.replace(/^\/+/, ""));
+      let issuer = urlObj.searchParams.get("issuer") || "";
+      let accountLabel = rawLabel;
+      if (rawLabel.includes(":")) {
+        const [pIssuer, pAcc] = rawLabel.split(":", 2);
+        if (!issuer) issuer = pIssuer.trim();
+        accountLabel = (pAcc || "").trim();
+      }
+      const normalized = await invoke<string>("parse_totp_input", { raw: text });
+      openAddModal();
+      editForm.value.title = issuer || accountLabel || "TOTP 账号";
+      if (accountLabel.includes("@")) {
+        editForm.value.email = accountLabel;
+        editForm.value.username = accountLabel;
+      } else {
+        editForm.value.username = accountLabel;
+      }
+      editForm.value.totp = normalized;
+      homeTab.value = "totp";
+      notify(`已识别 ${editForm.value.title} 的 2FA 密钥，请确认后保存`, "success");
+      return;
+    } catch (e: any) {
+      notify(`解析 TOTP 二维码失败: ${e}`, "error");
+      return;
+    }
+  }
+
+  // 2. FIDO / Passkey QR
+  if (text.toUpperCase().startsWith("FIDO:/")) {
+    notify("检测到 FIDO 跨设备蓝牙通行密钥二维码；请在浏览器中安装 AccountVault 扩展直接保存或登录网站 PassKey", "info", 5500);
+    return;
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && parsed.credential_id && parsed.rp_id && parsed.private_key_jwk) {
+      openAddModal();
+      editForm.value.title = parsed.rp_name || parsed.rp_id;
+      editForm.value.login_url = `https://${parsed.rp_id}`;
+      editForm.value.username = parsed.user_name || "";
+      editForm.value.passkeys = [parsed];
+      homeTab.value = "passkeys";
+      notify(`已识别 ${parsed.rp_id} 的 PassKey，请确认保存`, "success");
+      return;
+    }
+  } catch (_) {}
+
+  // 3. Plain Base32 TOTP secret fallback
+  try {
+    const normalized = await invoke<string>("parse_totp_input", { raw: text });
+    openAddModal();
+    editForm.value.totp = normalized;
+    homeTab.value = "totp";
+    notify("已识别 2FA 密钥，请补充平台与账号后保存", "success");
+  } catch (_) {
+    if (text.startsWith("http://") || text.startsWith("https://")) {
+      openAddModal();
+      editForm.value.login_url = text;
+      notify("已识别网址链接，已填入新建账号表单", "info");
+    } else {
+      notify("已识别二维码内容，但非标准 TOTP / PassKey 格式", "warning");
+    }
+  }
+}
+
 // Copy Helper
 async function copyText(text: string, fieldKey: string, toastMsg = "已成功复制到剪贴板") {
   if (!text) return;
@@ -1258,7 +1421,8 @@ function openAddModal() {
     totp: "",
     backup_codes: "",
     used_backup_codes: "[]",
-    notes: ""
+    notes: "",
+    passkeys: []
   };
   isEditing.value = true;
 }
@@ -2892,89 +3056,94 @@ onUnmounted(() => {
     <!-- 2. MAIN APPLICATION WORKSPACE -->
     <template v-else>
       <!-- 2.1 DESKTOP HEADER (md and above) -->
-      <header class="hidden md:flex h-14 bg-white border-b border-[#dadce0] px-4 items-center justify-between gap-4 flex-shrink-0 z-10">
-        <div class="flex items-center gap-3">
-          <div class="w-8 h-8 rounded-lg bg-white border border-[#dadce0]/60 flex items-center justify-center p-0.5 overflow-hidden shadow-xs">
+      <header class="hidden md:flex h-14 bg-white/95 backdrop-blur-md border-b border-slate-200/80 px-5 items-center justify-between gap-4 flex-shrink-0 z-10">
+        <div class="flex items-center gap-2.5 min-w-0">
+          <div class="w-8 h-8 rounded-xl bg-white border border-slate-200/80 flex items-center justify-center p-0.5 overflow-hidden shadow-2xs flex-shrink-0">
             <img src="/logo.png" alt="Logo" class="w-full h-full object-contain" />
           </div>
-          <div class="flex items-baseline gap-2">
-            <span class="font-bold text-base text-[#202124] tracking-tight">账号管家</span>
-            <span class="text-[11px] font-semibold uppercase px-2 py-0.5 bg-[#e8f0fe] text-[#1a73e8] rounded-full">v{{ appVersion }}</span>
+          <div class="flex items-center gap-2">
+            <span class="font-bold text-[15px] text-slate-900 tracking-tight">账号管家</span>
             <button
               v-if="updateResult?.has_update"
               @click="openSettingsModal('updates')"
-              class="text-[11px] font-semibold px-2 py-0.5 bg-emerald-100 hover:bg-emerald-200 text-emerald-800 rounded-full flex items-center gap-1 transition-colors cursor-pointer"
+              class="text-[11px] font-semibold px-2 py-0.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-full flex items-center gap-1 transition-colors cursor-pointer"
               title="点击前往检查更新并一键升级"
             >
               <Sparkles class="w-3 h-3 text-emerald-600" />
-              <span>新版本 {{ updateResult.latest_version }}</span>
+              <span>{{ updateResult.latest_version }}</span>
             </button>
           </div>
         </div>
 
         <!-- Search Bar -->
-        <div class="flex-1 max-w-md relative">
-          <Search class="w-4 h-4 text-[#5f6368] absolute left-3.5 top-1/2 -translate-y-1/2" />
+        <div class="flex-1 max-w-lg relative">
+          <Search class="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
           <input
             type="text"
             v-model="searchQuery"
-            placeholder="搜索平台、账号、邮箱、分组或备注..."
-            class="w-full pl-9 pr-8 py-1.5 bg-[#f1f3f4] hover:bg-[#e8eaed] focus:bg-white rounded-full border border-transparent focus:border-[#1a73e8] outline-none text-xs text-[#202124] transition-all"
+            placeholder="搜索平台、账号、邮箱或备注..."
+            class="w-full h-9 pl-9 pr-8 bg-slate-100/90 hover:bg-slate-100 focus:bg-white rounded-xl border border-transparent focus:border-blue-500/60 focus:ring-4 focus:ring-blue-500/10 outline-none text-xs text-slate-900 placeholder:text-slate-400 transition-all"
           />
           <button
             v-if="searchQuery"
             @click="searchQuery = ''"
-            class="absolute right-3 top-1/2 -translate-y-1/2 text-[#5f6368] hover:text-[#202124] cursor-pointer"
+            class="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 cursor-pointer"
           >
             <X class="w-3.5 h-3.5" />
           </button>
         </div>
 
         <!-- Right Toolbar Actions -->
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-1.5">
           <button
             @click="openAddModal"
-            class="h-9 px-3.5 bg-[#1a73e8] hover:bg-[#1557b0] active:bg-[#174ea6] text-white rounded-full text-xs font-medium flex items-center gap-1.5 shadow-sm transition-all cursor-pointer"
+            class="h-9 px-3.5 bg-gradient-to-r from-[#1a73e8] to-[#4f46e5] hover:brightness-105 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-sm transition-all cursor-pointer"
           >
             <Plus class="w-4 h-4" />
-            <span>添加账号</span>
+            <span>新建</span>
+          </button>
+
+          <button
+            @click="openQuickScanModal"
+            class="h-9 px-3 bg-slate-100/90 hover:bg-blue-50 text-slate-700 hover:text-[#1a73e8] rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer"
+            title="扫码添加 TOTP / PassKey"
+          >
+            <QrCode class="w-4 h-4 text-[#1a73e8]" />
+            <span>扫码</span>
           </button>
 
           <button
             @click="openPasswordGenModal"
-            class="h-9 px-3 bg-[#f1f3f4] hover:bg-[#e8eaed] text-[#3c4043] rounded-full text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer"
+            class="w-9 h-9 bg-slate-100/80 hover:bg-slate-200/70 text-slate-700 rounded-xl flex items-center justify-center transition-all cursor-pointer"
             title="强随机密码生成器"
           >
-            <KeyRound class="w-3.5 h-3.5 text-[#1a73e8]" />
-            <span>密码生成器</span>
+            <KeyRound class="w-4 h-4 text-[#1a73e8]" />
           </button>
 
           <button
             @click="openBatchImportModal"
-            class="h-9 px-3 bg-[#f1f3f4] hover:bg-[#e8eaed] text-[#3c4043] rounded-full text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer"
-            title="批量导入多条账号"
+            class="w-9 h-9 bg-slate-100/80 hover:bg-slate-200/70 text-slate-700 rounded-xl flex items-center justify-center transition-all cursor-pointer"
+            title="批量导入账号 (Chrome/Edge/密码管理器)"
           >
-            <Upload class="w-3.5 h-3.5 text-[#1a73e8]" />
-            <span>批量导入</span>
+            <Upload class="w-4 h-4 text-[#1a73e8]" />
           </button>
 
           <button
             @click="triggerSmartSync(false)"
             :disabled="syncState === 'syncing'"
-            class="h-9 px-3 bg-[#f1f3f4] hover:bg-[#e8eaed] text-[#3c4043] rounded-full text-xs font-medium flex items-center gap-1.5 transition-all relative cursor-pointer disabled:opacity-75"
-            :title="`WebDAV 增量智能同步: ${syncTooltip} (点击立即执行同步)`"
+            class="w-9 h-9 bg-slate-100/80 hover:bg-slate-200/70 text-slate-700 rounded-xl flex items-center justify-center transition-all relative cursor-pointer disabled:opacity-75"
+            :title="`WebDAV 云同步: ${syncTooltip}`"
           >
-            <RefreshCw v-if="syncState === 'syncing'" class="w-3.5 h-3.5 text-[#1a73e8] animate-spin" />
+            <RefreshCw v-if="syncState === 'syncing'" class="w-4 h-4 text-[#1a73e8] animate-spin" />
             <Cloud
               v-else
               :class="[
-                'w-3.5 h-3.5',
+                'w-4 h-4',
                 syncState === 'error' ? 'text-rose-500' :
                 syncState === 'success' ? 'text-emerald-500' :
-                webdavForm.url ? 'text-[#1a73e8]' : 'text-[#80868b]'
+                webdavForm.url ? 'text-[#1a73e8]' : 'text-slate-400'
               ]"
             />
-            <span>{{ syncState === 'syncing' ? '同步中' : syncState === 'error' ? '同步失败' : '云同步' }}</span>
             <span
               v-if="webdavForm.url && webdavForm.auto_sync"
               :class="[
@@ -2988,40 +3157,38 @@ onUnmounted(() => {
 
           <button
             @click="openSettingsModal('security')"
-            class="h-9 px-3.5 bg-[#f1f3f4] hover:bg-[#e8eaed] text-[#3c4043] rounded-full text-xs font-medium flex items-center gap-1.5 transition-all relative cursor-pointer"
+            class="w-9 h-9 bg-slate-100/80 hover:bg-slate-200/70 text-slate-700 rounded-xl flex items-center justify-center transition-all relative cursor-pointer"
             title="设置与偏好"
           >
-            <Settings class="w-3.5 h-3.5 text-[#1a73e8]" />
-            <span>设置</span>
+            <Settings class="w-4 h-4 text-slate-600" />
             <span v-if="helloStatus.enrolled" class="w-1.5 h-1.5 rounded-full bg-emerald-500 absolute top-2 right-2"></span>
           </button>
 
           <button
             @click="lockVault"
-            class="h-9 px-3 bg-[#f1f3f4] hover:bg-[#e8eaed] text-[#3c4043] rounded-full text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer"
+            class="w-9 h-9 bg-slate-100/80 hover:bg-rose-50 text-slate-600 hover:text-rose-600 rounded-xl flex items-center justify-center transition-all cursor-pointer"
             title="锁定保险库"
           >
-            <Lock class="w-3.5 h-3.5" />
-            <span>锁定</span>
+            <Lock class="w-4 h-4" />
           </button>
         </div>
       </header>
 
       <!-- 2.2 MOBILE HEADER (< md) -->
-      <header class="md:hidden bg-white border-b border-[#dadce0] flex flex-col flex-shrink-0 z-20">
-        <div class="h-13 px-3.5 flex items-center justify-between gap-2">
-          <div class="flex items-center gap-2 flex-1 min-w-0 overflow-hidden">
-            <div class="w-7 h-7 rounded-lg bg-white border border-[#dadce0]/60 flex items-center justify-center p-0.5 overflow-hidden shadow-2xs flex-shrink-0">
+      <header class="md:hidden bg-white/95 backdrop-blur-md border-b border-slate-200/80 flex flex-col flex-shrink-0 z-20">
+        <div class="h-14 px-4 flex items-center justify-between gap-2">
+          <div class="flex items-center gap-2.5 flex-1 min-w-0 overflow-hidden">
+            <div class="w-8 h-8 rounded-xl bg-white border border-slate-200/80 flex items-center justify-center p-0.5 overflow-hidden shadow-2xs flex-shrink-0">
               <img src="/logo.png" alt="Logo" class="w-full h-full object-contain" />
             </div>
-            <span class="font-bold text-sm text-[#202124] tracking-tight truncate">账号管家</span>
+            <span class="font-bold text-[15px] text-slate-900 tracking-tight truncate">账号管家</span>
           </div>
 
-          <div class="flex items-center gap-1 flex-shrink-0">
+          <div class="flex items-center gap-1.5 flex-shrink-0">
             <button
               @click="showMobileSearch = !showMobileSearch"
-              class="w-8 h-8 rounded-full flex items-center justify-center text-[#5f6368] hover:bg-[#f1f3f4] transition-colors cursor-pointer"
-              :class="{ 'bg-[#e8f0fe] text-[#1a73e8]': showMobileSearch || searchQuery }"
+              class="w-9 h-9 rounded-xl flex items-center justify-center text-slate-600 hover:bg-slate-100 transition-colors cursor-pointer"
+              :class="{ 'bg-blue-50 text-[#1a73e8]': showMobileSearch || searchQuery }"
               title="搜索"
             >
               <Search class="w-4 h-4" />
@@ -3030,7 +3197,7 @@ onUnmounted(() => {
             <button
               @click="triggerSmartSync(false)"
               :disabled="syncState === 'syncing'"
-              class="w-8 h-8 rounded-full flex items-center justify-center text-[#5f6368] hover:bg-[#f1f3f4] transition-colors relative cursor-pointer disabled:opacity-75"
+              class="w-9 h-9 rounded-xl flex items-center justify-center text-slate-600 hover:bg-slate-100 transition-colors relative cursor-pointer disabled:opacity-75"
             >
               <RefreshCw v-if="syncState === 'syncing'" class="w-4 h-4 text-[#1a73e8] animate-spin" />
               <Cloud
@@ -3039,9 +3206,25 @@ onUnmounted(() => {
                   'w-4 h-4',
                   syncState === 'error' ? 'text-rose-500' :
                   syncState === 'success' ? 'text-emerald-500' :
-                  webdavForm.url ? 'text-[#1a73e8]' : 'text-[#80868b]'
+                  webdavForm.url ? 'text-[#1a73e8]' : 'text-slate-400'
                 ]"
               />
+            </button>
+
+            <button
+              @click="openAddModal()"
+              class="w-9 h-9 rounded-xl bg-gradient-to-r from-[#1a73e8] to-[#4f46e5] text-white flex items-center justify-center shadow-xs cursor-pointer"
+              title="添加新账号"
+            >
+              <Plus class="w-4 h-4" />
+            </button>
+
+            <button
+              @click="openQuickScanModal()"
+              class="w-9 h-9 rounded-xl bg-slate-100 text-[#1a73e8] flex items-center justify-center cursor-pointer"
+              title="扫码添加 TOTP / PassKey"
+            >
+              <QrCode class="w-4 h-4" />
             </button>
 
             <div class="relative">
@@ -3136,109 +3319,45 @@ onUnmounted(() => {
       <div class="flex-1 flex overflow-hidden relative">
         
         <!-- COLUMN 1: SIDEBAR (Desktop only) -->
-        <aside class="hidden md:flex w-56 bg-white border-r border-[#dadce0] flex-col flex-shrink-0">
-          <div class="px-4 py-3 border-b border-[#f1f3f4]">
-            <h2 class="text-[11px] font-bold text-[#5f6368] uppercase tracking-wider">账号分组</h2>
+        <aside class="hidden md:flex w-52 bg-slate-50/80 border-r border-slate-200/80 flex-col flex-shrink-0">
+          <div class="px-4 pt-3.5 pb-2">
+            <h2 class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">分组视图</h2>
           </div>
 
-          <div class="flex-1 overflow-y-auto p-2 space-y-0.5">
+          <div class="flex-1 overflow-y-auto px-2.5 pb-24 space-y-1">
             <button
               v-for="g in groups"
               :key="g.label"
               @click="currentGroup = g.key"
               :class="[
-                'w-full px-3 py-2 rounded-xl text-xs font-medium flex items-center justify-between transition-colors cursor-pointer',
+                'w-full px-3 py-2 rounded-xl text-xs font-medium flex items-center justify-between transition-all cursor-pointer',
                 currentGroup === g.key
-                  ? 'bg-[#e8f0fe] text-[#1a73e8] font-semibold'
-                  : 'text-[#444746] hover:bg-[#f1f3f4]'
+                  ? 'bg-white text-[#1a73e8] font-semibold shadow-2xs ring-1 ring-slate-200/80'
+                  : 'text-slate-600 hover:bg-white/70 hover:text-slate-900'
               ]"
             >
               <div class="flex items-center gap-2 truncate">
-                <Folder class="w-3.5 h-3.5 flex-shrink-0 text-[#5f6368]" />
+                <Folder class="w-3.5 h-3.5 flex-shrink-0" :class="currentGroup === g.key ? 'text-[#1a73e8]' : 'text-slate-400'" />
                 <span class="truncate">{{ g.label }}</span>
               </div>
-              <span class="text-[11px] text-[#5f6368] bg-black/5 px-2 py-0.5 rounded-full font-mono">{{ g.count }}</span>
+              <span
+                :class="[
+                  'text-[11px] px-2 py-0.5 rounded-full font-mono',
+                  currentGroup === g.key ? 'bg-blue-50 text-[#1a73e8]' : 'bg-slate-200/60 text-slate-500'
+                ]"
+              >{{ g.count }}</span>
             </button>
           </div>
         </aside>
 
         <!-- COLUMN 2: MIDDLE ACCOUNT LIST -->
         <main
-          class="bg-white border-r border-[#dadce0] flex flex-col overflow-hidden"
+          class="bg-slate-50/40 border-r border-slate-200/80 flex flex-col overflow-hidden"
           :class="[
             mobileView === 'detail' ? 'hidden md:flex' : 'flex flex-1 w-full',
             'md:flex md:flex-1'
           ]"
         >
-          <div class="px-3.5 py-1.5 bg-[#f8fafd] border-b border-[#dadce0] flex items-center justify-between text-xs text-[#5f6368] gap-2">
-            <div class="flex items-center gap-2 min-w-0 overflow-hidden">
-              <button
-                v-if="isBatchSelectMode"
-                type="button"
-                @click="toggleSelectAllFiltered"
-                class="px-2 py-0.5 bg-white hover:bg-[#e8f0fe] text-[#1a73e8] border border-[#1a73e8]/40 rounded-md text-[11px] font-semibold flex items-center gap-1 cursor-pointer transition-colors flex-shrink-0"
-              >
-                <CheckSquare v-if="isAllFilteredSelected" class="w-3 h-3" />
-                <Square v-else class="w-3 h-3" />
-                <span>{{ isAllFilteredSelected ? '取消全选' : '全选' }}</span>
-              </button>
-              <span class="truncate">
-                {{
-                  isBatchSelectMode
-                    ? `已选 ${selectedBatchIds.length}/${filteredRecords.length}`
-                    : homeTab === 'totp'
-                    ? `TOTP 验证器 · ${filteredRecords.length} 项`
-                    : homeTab === 'passkeys'
-                    ? `PassKey 通行密钥 · ${filteredRecords.length} 项`
-                    : `全部密码 · ${filteredRecords.length} 个账号`
-                }}
-              </span>
-              <span v-if="!isBatchSelectMode" class="text-[11px] text-[#80868b] hidden lg:inline flex-shrink-0">· 双击编辑</span>
-            </div>
-
-            <div class="flex items-center gap-1.5 flex-shrink-0">
-              <button
-                type="button"
-                @click="showFilterPanel = !showFilterPanel"
-                :class="[
-                  'px-2 py-0.5 border rounded-md text-[11px] font-medium flex items-center gap-1 transition-all cursor-pointer shadow-2xs',
-                  showFilterPanel || activeFilterCount > 0
-                    ? 'bg-[#e8f0fe] text-[#1a73e8] border-[#1a73e8]/60 font-semibold'
-                    : 'bg-white hover:bg-[#e8eaed] text-[#3c4043] border-[#dadce0]/80'
-                ]"
-              >
-                <Filter class="w-3 h-3 text-[#1a73e8]" />
-                <span>筛选</span>
-                <span v-if="activeFilterCount > 0" class="px-1.2 py-0.2 bg-[#1a73e8] text-white rounded-full text-[9px] font-bold leading-none">
-                  {{ activeFilterCount }}
-                </span>
-              </button>
-
-              <button
-                type="button"
-                @click="toggleBatchSelectMode"
-                :class="[
-                  'px-2 py-0.5 border rounded-md text-[11px] font-medium flex items-center gap-1 transition-all cursor-pointer shadow-2xs',
-                  isBatchSelectMode
-                    ? 'bg-[#1a73e8] text-white border-[#1a73e8]'
-                    : 'bg-white hover:bg-[#e8eaed] text-[#3c4043] border-[#dadce0]/80'
-                ]"
-              >
-                <CheckSquare class="w-3 h-3" :class="isBatchSelectMode ? 'text-white' : 'text-[#1a73e8]'" />
-                <span>{{ isBatchSelectMode ? '退出批量' : '批量管理' }}</span>
-              </button>
-
-              <button
-                type="button"
-                @click="cycleSortRule"
-                class="px-2 py-0.5 bg-white hover:bg-[#e8eaed] text-[#3c4043] border border-[#dadce0]/80 rounded-md text-[11px] font-medium flex items-center gap-1 transition-all cursor-pointer shadow-2xs"
-              >
-                <ArrowUpDown class="w-3 h-3 text-[#1a73e8]" />
-                <span>{{ sortRuleLabel }}</span>
-              </button>
-            </div>
-          </div>
-
           <!-- Multi-Attribute Filter Collapsible Panel -->
           <div
             v-if="showFilterPanel"
@@ -3342,24 +3461,24 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div class="flex-1 overflow-y-auto divide-y divide-[#f1f3f4] pb-24" @click.self="selectedId = null">
+          <div class="flex-1 overflow-y-auto px-2.5 py-2 space-y-1.5 pb-24" @click.self="selectedId = null">
             <div
               v-for="r in filteredRecords"
               :key="r.id"
               @click="isBatchSelectMode ? toggleSelectBatchItem(r.id) : selectAccount(r.id)"
               @dblclick="openEditModal(r)"
               :class="[
-                'px-3 py-2.5 md:px-4 md:py-3 flex items-center justify-between gap-2 cursor-pointer transition-colors',
+                'px-3.5 py-3 rounded-2xl border flex items-center justify-between gap-3 cursor-pointer transition-all',
                 isBatchSelectMode && selectedBatchIds.includes(r.id)
-                  ? 'bg-[#e8f0fe]/70'
+                  ? 'bg-blue-50/80 border-blue-300 shadow-2xs'
                   : selectedId === r.id
-                  ? 'bg-[#edf2fa]'
+                  ? 'bg-white border-[#1a73e8]/50 ring-2 ring-[#1a73e8]/15 shadow-xs'
                   : r.is_pinned
-                  ? 'bg-amber-50/25 hover:bg-amber-50/50'
-                  : 'hover:bg-[#f8fafd]'
+                  ? 'bg-amber-50/40 hover:bg-white border-amber-200/70 shadow-2xs'
+                  : 'bg-white/90 hover:bg-white border-slate-200/70 hover:border-slate-300 shadow-2xs'
               ]"
             >
-              <div class="flex items-center gap-2 md:gap-2.5 min-w-0 flex-1">
+              <div class="flex items-center gap-3 min-w-0 flex-1">
                 <button
                   v-if="isBatchSelectMode"
                   type="button"
@@ -3367,14 +3486,14 @@ onUnmounted(() => {
                   class="text-[#1a73e8] flex-shrink-0 cursor-pointer"
                 >
                   <CheckSquare v-if="selectedBatchIds.includes(r.id)" class="w-4 h-4 text-[#1a73e8]" />
-                  <Square v-else class="w-4 h-4 text-[#80868b]" />
+                  <Square v-else class="w-4 h-4 text-slate-400" />
                 </button>
 
                 <div
                   v-if="showListAvatar"
                   :class="[
-                    'w-8 h-8 md:w-9 md:h-9 rounded-full font-bold text-xs md:text-sm flex items-center justify-center flex-shrink-0 relative',
-                    getFaviconUrl(r) ? 'bg-white border border-[#dadce0]/80' : 'bg-[#e8f0fe] text-[#1a73e8]'
+                    'w-10 h-10 rounded-xl font-bold text-sm flex items-center justify-center flex-shrink-0 relative shadow-2xs',
+                    getFaviconUrl(r) ? 'bg-white border border-slate-200/80' : 'bg-blue-50 text-[#1a73e8] border border-blue-100'
                   ]"
                 >
                   <img
@@ -3382,7 +3501,7 @@ onUnmounted(() => {
                     :src="getFaviconUrl(r)!"
                     @error="handleFaviconError(r)"
                     alt=""
-                    class="w-5 h-5 rounded-full object-contain"
+                    class="w-6 h-6 rounded-md object-contain"
                     loading="lazy"
                   />
                   <span v-else>{{ (getDisplayTitle(r)[0] || getPrimaryIdentifier(r)[0] || 'A').toUpperCase() }}</span>
@@ -3390,39 +3509,37 @@ onUnmounted(() => {
                     type="button"
                     @click.stop="togglePinRecord(r)"
                     :class="[
-                      'w-4 h-4 rounded-full flex items-center justify-center absolute -bottom-0.5 -right-0.5 transition-all cursor-pointer shadow-2xs ring-1 ring-white',
+                      'w-4 h-4 rounded-full flex items-center justify-center absolute -bottom-1 -right-1 transition-all cursor-pointer shadow-2xs ring-1 ring-white',
                       r.is_pinned
                         ? 'bg-amber-50 text-amber-400 hover:scale-110'
-                        : 'bg-white text-[#dadce0] hover:text-amber-400 hover:scale-110'
+                        : 'bg-white text-slate-300 hover:text-amber-400 hover:scale-110'
                     ]"
                     :title="r.is_pinned ? '取消星标置顶' : '设为星标置顶'"
                   >
-                    <Star class="w-2.5 h-2.5" :class="r.is_pinned ? 'text-amber-400 fill-amber-400' : 'text-[#dadce0]'" />
+                    <Star class="w-2.5 h-2.5" :class="r.is_pinned ? 'text-amber-400 fill-amber-400' : 'text-slate-300'" />
                   </button>
                 </div>
 
                 <div class="min-w-0 flex-1">
-                  <div class="text-xs font-bold text-[#202124] flex items-center gap-1.5 min-w-0">
+                  <div class="text-[13px] font-bold text-slate-900 flex items-center gap-1.5 min-w-0">
                     <button
                       v-if="!showListAvatar"
                       type="button"
                       @click.stop="togglePinRecord(r)"
                       class="p-0.5 -ml-0.5 rounded-full hover:bg-black/5 transition-colors flex-shrink-0 cursor-pointer"
                     >
-                      <Star class="w-3.5 h-3.5" :class="r.is_pinned ? 'text-amber-400 fill-amber-400' : 'text-[#dadce0]'" />
+                      <Star class="w-3.5 h-3.5" :class="r.is_pinned ? 'text-amber-400 fill-amber-400' : 'text-slate-300'" />
                     </button>
                     <span class="truncate">{{ getDisplayTitle(r) }}</span>
-                    <span :class="[getStatusBadgeClass(r.status), 'hidden md:inline-flex flex-shrink-0']">{{ r.status || '正常' }}</span>
-                    <span v-if="r.plan" class="hidden md:inline-block px-1.5 py-0.2 bg-[#e8f0fe] text-[#1a73e8] rounded text-[10px] font-mono flex-shrink-0">{{ r.plan }}</span>
+                    <span v-if="r.status && r.status !== '正常'" :class="[getStatusBadgeClass(r.status), 'hidden md:inline-flex flex-shrink-0']">{{ r.status }}</span>
                     <span v-if="r.expire_at && getExpireBadge(r.expire_at)" :class="[getExpireBadge(r.expire_at)?.class, 'hidden md:inline-flex flex-shrink-0']">
                       {{ getExpireBadge(r.expire_at)?.label }}
                     </span>
                   </div>
 
-                  <div class="text-[11px] text-[#5f6368] flex items-center gap-1.5 mt-0.5 min-w-0">
-                    <span class="truncate font-medium text-[#3c4043]">{{ getPrimaryIdentifier(r) || r.email || '未填账号' }}</span>
-                    <span v-if="r.group" class="px-1.5 py-0.2 bg-[#f1f3f4] text-[#444746] rounded text-[10px] flex-shrink-0">{{ r.group }}</span>
-                    <span v-if="r.proxy" class="px-1.5 py-0.2 bg-purple-50 text-purple-700 border border-purple-200 rounded text-[10px] font-mono flex-shrink-0">独立IP</span>
+                  <div class="text-xs text-slate-500 flex items-center gap-1.5 mt-0.5 min-w-0">
+                    <span class="truncate font-medium text-slate-600">{{ getPrimaryIdentifier(r) || r.email || '未填账号' }}</span>
+                    <span v-if="r.group" class="px-1.5 py-0.2 bg-slate-100 text-slate-500 rounded-md text-[10px] flex-shrink-0">{{ r.group }}</span>
                   </div>
                 </div>
               </div>
@@ -3556,7 +3673,7 @@ onUnmounted(() => {
 
         <!-- COLUMN 3: RIGHT DETAIL CARD -->
         <aside
-          class="bg-[#f8fafd] flex flex-col overflow-y-auto p-3 gap-2.5 border-l border-[#dadce0]/70 flex-shrink-0"
+          class="bg-slate-50/70 flex flex-col overflow-y-auto p-4 pb-24 gap-3 border-l border-slate-200/80 flex-shrink-0"
           :class="[
             mobileView === 'detail' ? 'flex flex-1 w-full' : 'hidden md:flex',
             'md:flex md:flex-none'
@@ -3586,12 +3703,12 @@ onUnmounted(() => {
             </div>
 
             <!-- Account Header Card -->
-            <div class="bg-white rounded-2xl p-3 border border-[#dadce0]/80 shadow-2xs">
-              <div class="flex items-center gap-2.5 mb-2.5">
+            <div class="bg-white rounded-2xl p-4 border border-slate-200/80 shadow-2xs">
+              <div class="flex items-center gap-3 mb-3.5">
                 <div
                   :class="[
-                    'w-9 h-9 rounded-full font-bold text-base flex items-center justify-center flex-shrink-0',
-                    getFaviconUrl(selectedRecord) ? 'bg-white border border-[#dadce0]/80' : 'bg-[#e8f0fe] text-[#1a73e8]'
+                    'w-12 h-12 rounded-2xl font-bold text-lg flex items-center justify-center flex-shrink-0 shadow-2xs',
+                    getFaviconUrl(selectedRecord) ? 'bg-white border border-slate-200/80' : 'bg-blue-50 text-[#1a73e8] border border-blue-100'
                   ]"
                 >
                   <img
@@ -3599,61 +3716,61 @@ onUnmounted(() => {
                     :src="getFaviconUrl(selectedRecord)!"
                     @error="handleFaviconError(selectedRecord)"
                     alt=""
-                    class="w-5 h-5 rounded-full object-contain"
+                    class="w-7 h-7 rounded-lg object-contain"
                   />
                   <span v-else>{{ (getDisplayTitle(selectedRecord)[0] || getPrimaryIdentifier(selectedRecord)[0] || 'A').toUpperCase() }}</span>
                 </div>
                 <div class="min-w-0 flex-1">
                   <div class="flex items-center justify-between gap-1.5">
-                    <div class="text-[11px] font-semibold text-[#1a73e8] truncate">{{ getDisplayTitle(selectedRecord) }}</div>
+                    <div class="text-sm font-bold text-slate-900 truncate">{{ getDisplayTitle(selectedRecord) }}</div>
                     <div class="flex items-center gap-1.5 flex-shrink-0">
-                      <button type="button" @click="togglePinRecord(selectedRecord)" class="p-0.5 rounded hover:bg-[#f1f3f4] cursor-pointer">
-                        <Star class="w-3.5 h-3.5" :class="selectedRecord.is_pinned ? 'text-amber-400 fill-amber-400' : 'text-[#80868b]'" />
+                      <button type="button" @click="togglePinRecord(selectedRecord)" class="p-1 rounded-lg hover:bg-slate-100 cursor-pointer">
+                        <Star class="w-4 h-4" :class="selectedRecord.is_pinned ? 'text-amber-400 fill-amber-400' : 'text-slate-300'" />
                       </button>
-                      <span :class="getStatusBadgeClass(selectedRecord.status)">{{ selectedRecord.status || '正常' }}</span>
+                      <span v-if="selectedRecord.status && selectedRecord.status !== '正常'" :class="getStatusBadgeClass(selectedRecord.status)">{{ selectedRecord.status }}</span>
                       <button
                         @click="selectedId = null"
-                        class="hidden md:flex p-0.5 hover:bg-[#f1f3f4] text-[#80868b] hover:text-[#202124] rounded-md cursor-pointer"
+                        class="hidden md:flex p-1 hover:bg-slate-100 text-slate-400 hover:text-slate-700 rounded-lg cursor-pointer"
                         title="取消选中 (Esc)"
                       >
-                        <X class="w-3.5 h-3.5" />
+                        <X class="w-4 h-4" />
                       </button>
                     </div>
                   </div>
-                  <div class="text-xs font-bold text-[#202124] truncate">{{ getPrimaryIdentifier(selectedRecord) || selectedRecord.email || '未填账号' }}</div>
+                  <div class="text-xs text-slate-500 truncate mt-0.5">{{ getPrimaryIdentifier(selectedRecord) || selectedRecord.email || '未填账号' }}</div>
                 </div>
               </div>
 
               <!-- Quick Launch Buttons -->
-              <div class="grid grid-cols-3 gap-1.5">
+              <div class="grid grid-cols-3 gap-2">
                 <button
                   @click="selectedRecord.login_url ? openInApp(selectedRecord.login_url) : openCustomUrlModal()"
                   :disabled="isOpeningBrowser"
-                  class="h-7 px-1.5 bg-[#f1f3f4] hover:bg-[#e8eaed] text-[#3c4043] rounded-lg text-[11px] font-medium flex items-center justify-center gap-1 transition-all disabled:opacity-50 cursor-pointer"
+                  class="h-8 px-2 bg-[#1a73e8] hover:bg-[#1557b0] text-white rounded-xl text-[11px] font-semibold flex items-center justify-center gap-1.5 transition-all disabled:opacity-50 shadow-2xs cursor-pointer"
                   :title="selectedRecord.login_url ? `在独立会话窗口打开 ${selectedRecord.login_url}` : '输入或选择网站在独立会话中打开'"
                 >
-                  <ExternalLink class="w-3 h-3 text-[#1a73e8]" />
+                  <ExternalLink class="w-3.5 h-3.5" />
                   <span>打开网页</span>
                 </button>
                 <button
                   @click="toggleBrowserTakeover(selectedRecord)"
                   :class="[
-                    'h-7 px-1.5 rounded-lg text-[11px] font-medium flex items-center justify-center gap-1 transition-all cursor-pointer',
+                    'h-8 px-2 rounded-xl text-[11px] font-semibold flex items-center justify-center gap-1 transition-all cursor-pointer',
                     isTakeoverActive && takeoverTargetRecord?.id === selectedRecord.id
-                      ? 'bg-[#1a73e8] hover:bg-[#1557b0] text-white shadow-xs animate-pulse'
-                      : 'bg-[#e8f0fe] hover:bg-[#d2e3fc] text-[#1a73e8]'
+                      ? 'bg-indigo-600 text-white shadow-xs animate-pulse'
+                      : 'bg-blue-50 hover:bg-blue-100 text-[#1a73e8]'
                   ]"
                 >
-                  <Zap class="w-3 h-3 flex-shrink-0" />
+                  <Zap class="w-3.5 h-3.5 flex-shrink-0" />
                   <span class="truncate">
                     {{ isTakeoverActive && takeoverTargetRecord?.id === selectedRecord.id ? `接管中 ${takeoverRemainingSec}s` : '接管登录' }}
                   </span>
                 </button>
                 <button
                   @click="openCustomUrlModal"
-                  class="h-7 px-1.5 bg-[#f1f3f4] hover:bg-[#e8eaed] text-[#3c4043] rounded-lg text-[11px] font-medium flex items-center justify-center gap-1 transition-all cursor-pointer"
+                  class="h-8 px-2 bg-slate-100 hover:bg-slate-200/80 text-slate-700 rounded-xl text-[11px] font-semibold flex items-center justify-center gap-1 transition-all cursor-pointer"
                 >
-                  <Compass class="w-3 h-3 text-[#1a73e8]" />
+                  <Compass class="w-3.5 h-3.5 text-[#1a73e8]" />
                   <span>更多网址</span>
                 </button>
 
@@ -3914,8 +4031,10 @@ onUnmounted(() => {
 
       <!-- FLOATING BOTTOM PILL TAB BAR (Windows & Android) -->
       <div
-        v-if="mobileView !== 'detail'"
-        class="fixed bottom-4 left-1/2 -translate-x-1/2 z-30 pointer-events-none"
+        :class="[
+          'fixed bottom-4 left-1/2 -translate-x-1/2 z-30 pointer-events-none',
+          mobileView === 'detail' ? 'hidden md:block' : 'block'
+        ]"
       >
         <nav
           class="pointer-events-auto bg-white/92 backdrop-blur-xl border border-[#dadce0]/90 shadow-xl rounded-full p-1.5 flex items-center gap-1"
@@ -5027,6 +5146,47 @@ onUnmounted(() => {
         <div class="w-full flex items-center justify-end gap-2 pt-1">
           <button type="button" @click="copyText(totpQrData.otpauth_url, 'qr_uri', '已复制 otpauth:// 链接')" class="px-3.5 py-2 bg-[#f1f3f4] text-[#3c4043] rounded-xl text-xs font-medium cursor-pointer">复制 otpauth 链接</button>
           <button type="button" @click="showTotpQrModal = false" class="px-5 py-2 bg-[#1a73e8] text-white rounded-xl text-xs font-medium cursor-pointer">完成</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- QUICK SCAN MODAL (TOTP / PASSKEY) -->
+    <div
+      v-if="showQuickScanModal"
+      @paste="handleQuickScanPaste"
+      class="fixed inset-0 z-[9995] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm"
+    >
+      <div class="w-full max-w-md bg-white rounded-3xl p-5 shadow-2xl border border-slate-200 flex flex-col gap-3.5">
+        <div class="flex items-center justify-between pb-2 border-b border-slate-100">
+          <div class="flex items-center gap-2">
+            <QrCode class="w-4 h-4 text-[#1a73e8]" />
+            <h3 class="text-sm font-bold text-slate-900">扫码添加 TOTP / PassKey</h3>
+          </div>
+          <button type="button" @click="closeQuickScanModal" class="p-1.5 hover:bg-slate-100 rounded-full text-slate-500 cursor-pointer">
+            <X class="w-4 h-4" />
+          </button>
+        </div>
+
+        <div class="w-full aspect-square max-h-64 bg-slate-900 rounded-2xl overflow-hidden flex items-center justify-center relative">
+          <video v-if="quickScanCameraActive" ref="quickScanVideoRef" playsinline muted class="w-full h-full object-cover"></video>
+          <div v-else class="p-6 text-center text-xs text-slate-300 space-y-2">
+            <QrCode class="w-10 h-10 mx-auto text-slate-400" />
+            <div>{{ quickScanCameraError || '正在请求摄像头权限...' }}</div>
+          </div>
+        </div>
+
+        <p class="text-[11px] text-slate-500 text-center">
+          支持扫描 <code class="px-1 py-0.5 bg-slate-100 rounded">otpauth://</code> 2FA 二维码或 PassKey 配置二维码；也可直接按 <kbd class="px-1.5 py-0.5 bg-slate-100 rounded border border-slate-200">Ctrl+V</kbd> 粘贴截图。
+        </p>
+
+        <div class="flex items-center justify-end gap-2 pt-1">
+          <button type="button" @click="triggerQuickScanImage" class="px-4 py-2 bg-[#1a73e8] hover:bg-[#1557b0] text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 cursor-pointer">
+            <Upload class="w-3.5 h-3.5" />
+            <span>从图片/截屏识别</span>
+          </button>
+          <button type="button" @click="closeQuickScanModal" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-medium cursor-pointer">
+            取消
+          </button>
         </div>
       </div>
     </div>
