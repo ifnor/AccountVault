@@ -51,7 +51,7 @@ import jsQR from "jsqr";
 import pkg from "../package.json";
 import { parseCsvImport, parseJsonImport } from "./utils/importParsers";
 
-const appVersion = ref(pkg.version || "1.1.3");
+const appVersion = ref(pkg.version || "1.1.5");
 
 interface AccountRecord {
   id: string;

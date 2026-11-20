@@ -651,28 +651,44 @@
           reply({ fallback: true });
           return;
         }
-        chrome.runtime.sendMessage({ type: "GET_CONFIG" }, async (cfg) => {
-          if (!cfg || cfg.promptStyle !== "overlay") {
-            chrome.runtime.sendMessage(
-              {
-                type: "OPEN_PASSKEY_PROMPT",
-                kind: "create",
-                rpId: payload.rpId,
-                rpName: payload.rpName,
-                userName: payload.userName,
-                userDisplayName: payload.userDisplayName
-              },
-              (res) => reply(res?.confirmed ? { ok: true } : { fallback: true })
-            );
-            return;
-          }
-          const res = await showPasskeyModal({
-            title: "使用 AccountVault 创建通行密钥？",
-            subtitle: `${payload.rpName || payload.rpId} · ${payload.userName || payload.userDisplayName || "新通行密钥"}`,
-            confirmLabel: "使用 AccountVault 保存"
+        const proceedPrompt = () => {
+          chrome.runtime.sendMessage({ type: "GET_CONFIG" }, async (cfg) => {
+            if (!cfg || cfg.promptStyle !== "overlay") {
+              chrome.runtime.sendMessage(
+                {
+                  type: "OPEN_PASSKEY_PROMPT",
+                  kind: "create",
+                  rpId: payload.rpId,
+                  rpName: payload.rpName,
+                  userName: payload.userName,
+                  userDisplayName: payload.userDisplayName
+                },
+                (res) => reply(res?.confirmed ? { ok: true } : { fallback: true })
+              );
+              return;
+            }
+            const res = await showPasskeyModal({
+              title: "使用 AccountVault 创建通行密钥？",
+              subtitle: `${payload.rpName || payload.rpId} · ${payload.userName || payload.userDisplayName || "新通行密钥"}`,
+              confirmLabel: "使用 AccountVault 保存"
+            });
+            reply(res.confirmed ? { ok: true } : { fallback: true });
           });
-          reply(res.confirmed ? { ok: true } : { fallback: true });
-        });
+        };
+        if (Array.isArray(payload.excludeIds) && payload.excludeIds.length > 0) {
+          chrome.runtime.sendMessage(
+            { type: "MATCH_PASSKEYS", rpId: payload.rpId, allowIds: payload.excludeIds },
+            (matchRes) => {
+              if (matchRes && matchRes.ok && Array.isArray(matchRes.items) && matchRes.items.length > 0) {
+                reply({ excluded: true });
+                return;
+              }
+              proceedPrompt();
+            }
+          );
+          return;
+        }
+        proceedPrompt();
       });
       return;
     }

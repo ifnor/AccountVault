@@ -134,27 +134,100 @@
     return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
   }
 
-  function makeCredentialResponseObj(credIdBytes, extraProps) {
+  function pad32(bytes) {
+    if (bytes.length === 32) return bytes;
+    if (bytes.length > 32) return bytes.subarray(bytes.length - 32);
+    const out = new Uint8Array(32);
+    out.set(bytes, 32 - bytes.length);
+    return out;
+  }
+
+  function detectCrossOrigin() {
+    try {
+      if (window.top === window) return false;
+      return window.top.location.origin !== window.location.origin;
+    } catch {
+      return true;
+    }
+  }
+
+  function makeCredentialResponseObj(credIdBytes, responseObj, clientExtResults) {
     const rawId = credIdBytes.buffer.slice(credIdBytes.byteOffset, credIdBytes.byteOffset + credIdBytes.byteLength);
     const id = b64urlEncode(credIdBytes);
-    const obj = {
-      id,
-      rawId,
-      type: "public-key",
-      authenticatorAttachment: "platform",
-      getClientExtensionResults: () => ({}),
-      ...extraProps
-    };
+    const extResults = clientExtResults || {};
+    const obj = typeof PublicKeyCredential !== "undefined"
+      ? Object.create(PublicKeyCredential.prototype)
+      : {};
+    Object.defineProperties(obj, {
+      id: { value: id, enumerable: true },
+      rawId: { value: rawId, enumerable: true },
+      type: { value: "public-key", enumerable: true },
+      authenticatorAttachment: { value: "platform", enumerable: true },
+      response: { value: responseObj, enumerable: true },
+      getClientExtensionResults: { value: () => extResults, enumerable: true }
+    });
     return obj;
+  }
+
+  // Fixed non-zero AAGUID for AccountVault (a0c7f2e4-8b1d-4e9a-9c3f-7a5d2e1b0f48)
+  const ACCOUNTVAULT_AAGUID = new Uint8Array([
+    0xa0, 0xc7, 0xf2, 0xe4, 0x8b, 0x1d, 0x4e, 0x9a,
+    0x9c, 0x3f, 0x7a, 0x5d, 0x2e, 0x1b, 0x0f, 0x48
+  ]);
+
+  function selectSupportedAlg(pubKeyCredParams) {
+    const algs = (pubKeyCredParams || []).map((p) => p.alg);
+    if (algs.length === 0) return -7;
+    if (algs.includes(-7)) return -7;
+    if (algs.includes(-257)) return -257;
+    return null;
+  }
+
+  function makeAttestationResponseObj(props) {
+    const resp = typeof AuthenticatorAttestationResponse !== "undefined"
+      ? Object.create(AuthenticatorAttestationResponse.prototype)
+      : {};
+    Object.defineProperties(resp, {
+      clientDataJSON: { value: props.clientDataJSON, enumerable: true },
+      attestationObject: { value: props.attestationObject, enumerable: true },
+      getTransports: { value: () => ["internal"], enumerable: true },
+      getAuthenticatorData: { value: () => props.authDataBuf, enumerable: true },
+      getPublicKey: { value: () => props.spkiBuf, enumerable: true },
+      getPublicKeyAlgorithm: { value: () => props.alg || -7, enumerable: true }
+    });
+    return resp;
+  }
+
+  function makeAssertionResponseObj(props) {
+    const resp = typeof AuthenticatorAssertionResponse !== "undefined"
+      ? Object.create(AuthenticatorAssertionResponse.prototype)
+      : {};
+    Object.defineProperties(resp, {
+      clientDataJSON: { value: props.clientDataJSON, enumerable: true },
+      authenticatorData: { value: props.authenticatorData, enumerable: true },
+      signature: { value: props.signature, enumerable: true },
+      userHandle: { value: props.userHandle, enumerable: true }
+    });
+    return resp;
   }
 
   navigator.credentials.create = async function (options) {
     if (!options || !options.publicKey) {
       return origCreate(options);
     }
+    if (options.signal?.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
     const pk = options.publicKey;
-    const algs = (pk.pubKeyCredParams || []).map((p) => p.alg);
-    if (algs.length > 0 && !algs.includes(-7)) {
+    // Immediately pass through requests that strictly require hardware attestation or roaming/USB keys
+    if (pk.attestation === "direct" || pk.attestation === "enterprise") {
+      return origCreate(options);
+    }
+    if (pk.authenticatorSelection?.authenticatorAttachment === "cross-platform") {
+      return origCreate(options);
+    }
+    const chosenAlg = selectSupportedAlg(pk.pubKeyCredParams);
+    if (chosenAlg === null) {
       return origCreate(options);
     }
 
@@ -163,24 +236,40 @@
     const userName = pk.user?.name || "";
     const userDisplayName = pk.user?.displayName || userName;
     const userId = b64urlEncode(toUint8(pk.user?.id));
+    const excludeIds = (pk.excludeCredentials || []).map((c) => b64urlEncode(toUint8(c.id)));
 
     const decision = await askContent("CREATE_PROMPT", {
       rpId,
       rpName,
       userName,
-      userDisplayName
+      userDisplayName,
+      excludeIds
     });
 
+    if (options.signal?.aborted) {
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }
+    if (decision && decision.excluded) {
+      throw new DOMException(
+        "The user attempted to register an authenticator that contains one of the credentials already registered with the relying party.",
+        "InvalidStateError"
+      );
+    }
     if (!decision || decision.fallback) {
       return origCreate(options);
     }
 
-    // Generate ECDSA P-256 keypair
-    const keyPair = await crypto.subtle.generateKey(
-      { name: "ECDSA", namedCurve: "P-256" },
-      true,
-      ["sign", "verify"]
-    );
+    // Generate ES256 (ECDSA P-256) or RS256 (RSA-2048) keypair
+    const keyGenParams = chosenAlg === -257
+      ? {
+          name: "RSASSA-PKCS1-v1_5",
+          modulusLength: 2048,
+          publicExponent: new Uint8Array([1, 0, 1]),
+          hash: "SHA-256"
+        }
+      : { name: "ECDSA", namedCurve: "P-256" };
+
+    const keyPair = await crypto.subtle.generateKey(keyGenParams, true, ["sign", "verify"]);
     const jwk = await crypto.subtle.exportKey("jwk", keyPair.privateKey);
     const spkiBuf = await crypto.subtle.exportKey("spki", keyPair.publicKey);
     const spkiBytes = new Uint8Array(spkiBuf);
@@ -191,31 +280,42 @@
       type: "webauthn.create",
       challenge: b64urlEncode(toUint8(pk.challenge)),
       origin: location.origin,
-      crossOrigin: false
+      crossOrigin: detectCrossOrigin()
     });
     const clientDataBytes = new TextEncoder().encode(clientDataStr);
 
     const rpIdHash = await sha256(new TextEncoder().encode(rpId));
-    const flags = new Uint8Array([0x45]); // UP (0x01) + UV (0x04) + AT (0x40)
+    // UP (0x01) + UV (0x04) + BE (0x08) + BS (0x10) + AT (0x40) = 0x5d
+    const flags = new Uint8Array([0x5d]);
     const signCount = new Uint8Array(4); // 0
-    const aaguid = new Uint8Array(16);
+    const aaguid = ACCOUNTVAULT_AAGUID;
     const credIdLen = new Uint8Array([(credIdBytes.length >> 8) & 0xff, credIdBytes.length & 0xff]);
 
-    const coseKey = new Map([
-      [1, 2],   // kty: EC2
-      [3, -7],  // alg: ES256
-      [-1, 1],  // crv: P-256
-      [-2, b64urlDecode(jwk.x)],
-      [-3, b64urlDecode(jwk.y)]
-    ]);
+    const coseKey = chosenAlg === -257
+      ? new Map([
+          [1, 3],     // kty: RSA
+          [3, -257],  // alg: RS256
+          [-1, b64urlDecode(jwk.n)],
+          [-2, b64urlDecode(jwk.e)]
+        ])
+      : new Map([
+          [1, 2],   // kty: EC2
+          [3, -7],  // alg: ES256
+          [-1, 1],  // crv: P-256
+          [-2, pad32(b64urlDecode(jwk.x))],
+          [-3, pad32(b64urlDecode(jwk.y))]
+        ]);
     const coseBytes = cborEncode(coseKey);
 
     const authData = concatBytes(rpIdHash, flags, signCount, aaguid, credIdLen, credIdBytes, coseBytes);
-    const attestationObject = cborEncode({
-      fmt: "none",
-      attStmt: {},
-      authData
-    });
+    // Canonical CBOR key order: length-first then lexicographical ("fmt":3, "attStmt":7, "authData":8)
+    const attestationObject = cborEncode(
+      new Map([
+        ["fmt", "none"],
+        ["attStmt", new Map()],
+        ["authData", authData]
+      ])
+    );
 
     const saveRes = await askContent("SAVE_PASSKEY", {
       rpId,
@@ -230,31 +330,38 @@
     });
 
     if (!saveRes || !saveRes.ok) {
-      return origCreate(options);
+      throw new DOMException(saveRes?.error || "Failed to save passkey in AccountVault", "UnknownError");
     }
 
     const toBuf = (u8) => u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
-    const response = {
+    const clientExtResults = {};
+    if (pk.extensions && pk.extensions.credProps) {
+      clientExtResults.credProps = { rk: true };
+    }
+
+    const response = makeAttestationResponseObj({
       clientDataJSON: toBuf(clientDataBytes),
       attestationObject: toBuf(attestationObject),
-      getTransports: () => ["internal"],
-      getAuthenticatorData: () => toBuf(authData),
-      getPublicKey: () => toBuf(spkiBytes),
-      getPublicKeyAlgorithm: () => -7
-    };
+      authDataBuf: toBuf(authData),
+      spkiBuf: toBuf(spkiBytes),
+      alg: chosenAlg
+    });
 
-    const credObj = makeCredentialResponseObj(credIdBytes, { response });
-    credObj.toJSON = () => ({
-      id: credObj.id,
-      rawId: credObj.id,
-      type: "public-key",
-      authenticatorAttachment: "platform",
-      clientExtensionResults: {},
-      response: {
-        clientDataJSON: b64urlEncode(clientDataBytes),
-        attestationObject: b64urlEncode(attestationObject),
-        transports: ["internal"]
-      }
+    const credObj = makeCredentialResponseObj(credIdBytes, response, clientExtResults);
+    Object.defineProperty(credObj, "toJSON", {
+      value: () => ({
+        id: credObj.id,
+        rawId: credObj.id,
+        type: "public-key",
+        authenticatorAttachment: "platform",
+        clientExtensionResults: clientExtResults,
+        response: {
+          clientDataJSON: b64urlEncode(clientDataBytes),
+          attestationObject: b64urlEncode(attestationObject),
+          transports: ["internal"]
+        }
+      }),
+      enumerable: true
     });
     return credObj;
   };
@@ -279,10 +386,11 @@
     const chosen = pickRes.passkey;
     const credIdBytes = b64urlDecode(chosen.credential_id);
     const jwk = JSON.parse(chosen.private_key_jwk);
+    const isRsa = jwk.kty === "RSA" || jwk.alg === "RS256";
     const privKey = await crypto.subtle.importKey(
       "jwk",
       jwk,
-      { name: "ECDSA", namedCurve: "P-256" },
+      isRsa ? { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" } : { name: "ECDSA", namedCurve: "P-256" },
       false,
       ["sign"]
     );
@@ -291,14 +399,15 @@
       type: "webauthn.get",
       challenge: b64urlEncode(toUint8(pk.challenge)),
       origin: location.origin,
-      crossOrigin: false
+      crossOrigin: detectCrossOrigin()
     });
     const clientDataBytes = new TextEncoder().encode(clientDataStr);
     const clientDataHash = await sha256(clientDataBytes);
 
     const nextCount = (chosen.sign_count || 0) + 1;
     const rpIdHash = await sha256(new TextEncoder().encode(chosen.rp_id || rpId));
-    const flags = new Uint8Array([0x05]); // UP (0x01) + UV (0x04)
+    // UP (0x01) + UV (0x04) + BE (0x08) + BS (0x10) = 0x1d
+    const flags = new Uint8Array([0x1d]);
     const signCount = new Uint8Array([
       (nextCount >>> 24) & 0xff,
       (nextCount >>> 16) & 0xff,
@@ -308,10 +417,14 @@
     const authData = concatBytes(rpIdHash, flags, signCount);
     const signedData = concatBytes(authData, clientDataHash);
 
-    const sigP1363 = new Uint8Array(
-      await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, privKey, signedData)
+    const rawSig = new Uint8Array(
+      await crypto.subtle.sign(
+        isRsa ? { name: "RSASSA-PKCS1-v1_5" } : { name: "ECDSA", hash: "SHA-256" },
+        privKey,
+        signedData
+      )
     );
-    const sigDer = p1363ToDer(sigP1363);
+    const finalSig = isRsa ? rawSig : p1363ToDer(rawSig);
 
     askContent("BUMP_PASSKEY", {
       credentialId: chosen.credential_id,
@@ -321,26 +434,29 @@
     const userHandleBytes = chosen.user_id ? b64urlDecode(chosen.user_id) : new Uint8Array(0);
     const toBuf = (u8) => u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
 
-    const response = {
+    const response = makeAssertionResponseObj({
       clientDataJSON: toBuf(clientDataBytes),
       authenticatorData: toBuf(authData),
-      signature: toBuf(sigDer),
+      signature: toBuf(finalSig),
       userHandle: userHandleBytes.length > 0 ? toBuf(userHandleBytes) : null
-    };
+    });
 
-    const credObj = makeCredentialResponseObj(credIdBytes, { response });
-    credObj.toJSON = () => ({
-      id: credObj.id,
-      rawId: credObj.id,
-      type: "public-key",
-      authenticatorAttachment: "platform",
-      clientExtensionResults: {},
-      response: {
-        clientDataJSON: b64urlEncode(clientDataBytes),
-        authenticatorData: b64urlEncode(authData),
-        signature: b64urlEncode(sigDer),
-        userHandle: userHandleBytes.length > 0 ? b64urlEncode(userHandleBytes) : undefined
-      }
+    const credObj = makeCredentialResponseObj(credIdBytes, response, {});
+    Object.defineProperty(credObj, "toJSON", {
+      value: () => ({
+        id: credObj.id,
+        rawId: credObj.id,
+        type: "public-key",
+        authenticatorAttachment: "platform",
+        clientExtensionResults: {},
+        response: {
+          clientDataJSON: b64urlEncode(clientDataBytes),
+          authenticatorData: b64urlEncode(authData),
+          signature: b64urlEncode(finalSig),
+          userHandle: userHandleBytes.length > 0 ? b64urlEncode(userHandleBytes) : undefined
+        }
+      }),
+      enumerable: true
     });
     return credObj;
   };

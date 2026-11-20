@@ -29,6 +29,16 @@ jobs:
           node-version: 22
           cache: 'npm'
 
+      - name: Sync version from tag
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag_name || (github.ref_type == 'tag' && github.ref_name) || '' }}"
+          if ($tag -match '^v?\d+\.\d+\.\d+') {
+            node scripts/sync-version.mjs $tag
+          } else {
+            node scripts/sync-version.mjs
+          }
+
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -133,6 +143,15 @@ jobs:
         with:
           node-version: 22
           cache: 'npm'
+
+      - name: Sync version from tag
+        run: |
+          TAG="${{ inputs.tag_name || (github.ref_type == 'tag' && github.ref_name) || '' }}"
+          if [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            node scripts/sync-version.mjs "$TAG"
+          else
+            node scripts/sync-version.mjs
+          fi
 
       - name: Setup Java JDK 21
         uses: actions/setup-java@v4
