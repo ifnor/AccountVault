@@ -29,8 +29,12 @@ fallbackBtn.onclick = () => submitResult({ fallback: true });
 
   const p = res.prompt;
   if (p.kind === "create") {
-    titleEl.textContent = "使用 AccountVault 创建通行密钥？";
-    subtitleEl.textContent = "通行密钥将加密保存在你的保险库中";
+    titleEl.textContent = p.isCrossPlatform
+      ? "使用 AccountVault 模拟外接安全密钥？"
+      : "使用 AccountVault 创建通行密钥？";
+    subtitleEl.textContent = p.isCrossPlatform
+      ? "将以 USB 安全密钥 (cross-platform) 模式保存；如需插物理密钥请点取消"
+      : "通行密钥将加密保存在你的保险库中";
     infoCardEl.innerHTML = "";
 
     const r1 = document.createElement("div");
@@ -46,6 +50,7 @@ fallbackBtn.onclick = () => submitResult({ fallback: true });
     infoCardEl.appendChild(r1);
     infoCardEl.appendChild(r2);
 
+    confirmBtn.textContent = p.isCrossPlatform ? "模拟安全密钥保存" : "使用 AccountVault 保存";
     confirmBtn.classList.remove("hidden");
     confirmBtn.onclick = () => submitResult({ confirmed: true });
   } else {

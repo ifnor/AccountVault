@@ -661,16 +661,19 @@
                   rpId: payload.rpId,
                   rpName: payload.rpName,
                   userName: payload.userName,
-                  userDisplayName: payload.userDisplayName
+                  userDisplayName: payload.userDisplayName,
+                  isCrossPlatform: !!payload.isCrossPlatform
                 },
                 (res) => reply(res?.confirmed ? { ok: true } : { fallback: true })
               );
               return;
             }
             const res = await showPasskeyModal({
-              title: "使用 AccountVault 创建通行密钥？",
-              subtitle: `${payload.rpName || payload.rpId} · ${payload.userName || payload.userDisplayName || "新通行密钥"}`,
-              confirmLabel: "使用 AccountVault 保存"
+              title: payload.isCrossPlatform
+                ? "使用 AccountVault 模拟外接安全密钥？"
+                : "使用 AccountVault 创建通行密钥？",
+              subtitle: `${payload.rpName || payload.rpId} · ${payload.userName || payload.userDisplayName || (payload.isCrossPlatform ? "模拟 USB 安全密钥" : "新通行密钥")}`,
+              confirmLabel: payload.isCrossPlatform ? "模拟安全密钥保存" : "使用 AccountVault 保存"
             });
             reply(res.confirmed ? { ok: true } : { fallback: true });
           });

@@ -318,6 +318,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             rpName: msg.rpName || "",
             userName: msg.userName || "",
             userDisplayName: msg.userDisplayName || "",
+            isCrossPlatform: !!msg.isCrossPlatform,
             items: msg.items || []
           },
           windowId: null,

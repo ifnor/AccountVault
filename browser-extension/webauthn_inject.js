@@ -151,7 +151,7 @@
     }
   }
 
-  function makeCredentialResponseObj(credIdBytes, responseObj, clientExtResults) {
+  function makeCredentialResponseObj(credIdBytes, responseObj, clientExtResults, attachment) {
     const rawId = credIdBytes.buffer.slice(credIdBytes.byteOffset, credIdBytes.byteOffset + credIdBytes.byteLength);
     const id = b64urlEncode(credIdBytes);
     const extResults = clientExtResults || {};
@@ -162,7 +162,7 @@
       id: { value: id, enumerable: true },
       rawId: { value: rawId, enumerable: true },
       type: { value: "public-key", enumerable: true },
-      authenticatorAttachment: { value: "platform", enumerable: true },
+      authenticatorAttachment: { value: attachment || "platform", enumerable: true },
       response: { value: responseObj, enumerable: true },
       getClientExtensionResults: { value: () => extResults, enumerable: true }
     });
@@ -190,7 +190,7 @@
     Object.defineProperties(resp, {
       clientDataJSON: { value: props.clientDataJSON, enumerable: true },
       attestationObject: { value: props.attestationObject, enumerable: true },
-      getTransports: { value: () => ["internal"], enumerable: true },
+      getTransports: { value: () => props.transports || ["internal"], enumerable: true },
       getAuthenticatorData: { value: () => props.authDataBuf, enumerable: true },
       getPublicKey: { value: () => props.spkiBuf, enumerable: true },
       getPublicKeyAlgorithm: { value: () => props.alg || -7, enumerable: true }
@@ -219,13 +219,13 @@
       throw new DOMException("The operation was aborted.", "AbortError");
     }
     const pk = options.publicKey;
-    // Immediately pass through requests that strictly require hardware attestation or roaming/USB keys
+    // Immediately pass through requests that strictly require FIDO MDS hardware attestation
     if (pk.attestation === "direct" || pk.attestation === "enterprise") {
       return origCreate(options);
     }
-    if (pk.authenticatorSelection?.authenticatorAttachment === "cross-platform") {
-      return origCreate(options);
-    }
+    const isCrossPlatform = pk.authenticatorSelection?.authenticatorAttachment === "cross-platform";
+    const attachment = isCrossPlatform ? "cross-platform" : "platform";
+    const transports = isCrossPlatform ? ["usb"] : ["internal"];
     const chosenAlg = selectSupportedAlg(pk.pubKeyCredParams);
     if (chosenAlg === null) {
       return origCreate(options);
@@ -243,7 +243,8 @@
       rpName,
       userName,
       userDisplayName,
-      excludeIds
+      excludeIds,
+      isCrossPlatform
     });
 
     if (options.signal?.aborted) {
@@ -285,8 +286,8 @@
     const clientDataBytes = new TextEncoder().encode(clientDataStr);
 
     const rpIdHash = await sha256(new TextEncoder().encode(rpId));
-    // UP (0x01) + UV (0x04) + BE (0x08) + BS (0x10) + AT (0x40) = 0x5d
-    const flags = new Uint8Array([0x5d]);
+    // Platform passkey: UP|UV|BE|BS|AT (0x5d); Roaming security key simulation: UP|UV|AT (0x45)
+    const flags = new Uint8Array([isCrossPlatform ? 0x45 : 0x5d]);
     const signCount = new Uint8Array(4); // 0
     const aaguid = ACCOUNTVAULT_AAGUID;
     const credIdLen = new Uint8Array([(credIdBytes.length >> 8) & 0xff, credIdBytes.length & 0xff]);
@@ -344,21 +345,22 @@
       attestationObject: toBuf(attestationObject),
       authDataBuf: toBuf(authData),
       spkiBuf: toBuf(spkiBytes),
-      alg: chosenAlg
+      alg: chosenAlg,
+      transports
     });
 
-    const credObj = makeCredentialResponseObj(credIdBytes, response, clientExtResults);
+    const credObj = makeCredentialResponseObj(credIdBytes, response, clientExtResults, attachment);
     Object.defineProperty(credObj, "toJSON", {
       value: () => ({
         id: credObj.id,
         rawId: credObj.id,
         type: "public-key",
-        authenticatorAttachment: "platform",
+        authenticatorAttachment: attachment,
         clientExtensionResults: clientExtResults,
         response: {
           clientDataJSON: b64urlEncode(clientDataBytes),
           attestationObject: b64urlEncode(attestationObject),
-          transports: ["internal"]
+          transports
         }
       }),
       enumerable: true
