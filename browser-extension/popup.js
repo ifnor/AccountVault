@@ -17,6 +17,9 @@ const davUrlInput = document.getElementById("dav-url-input");
 const davUserInput = document.getElementById("dav-user-input");
 const davPassInput = document.getElementById("dav-pass-input");
 const idleInput = document.getElementById("idle-input");
+const pinInput = document.getElementById("pin-input");
+const savePinBtn = document.getElementById("save-pin-btn");
+const clearPinBtn = document.getElementById("clear-pin-btn");
 const davTestMsg = document.getElementById("dav-test-msg");
 const testDavBtn = document.getElementById("test-dav-btn");
 const saveConfigBtn = document.getElementById("save-config");
@@ -168,6 +171,15 @@ async function refresh() {
       mainPanel.classList.add("hidden");
       return;
     }
+    if (st.hasPin) {
+      masterPwdInput.placeholder = "输入快捷 PIN 码或主密码...";
+      pinInput.placeholder = "已启用快捷 PIN（输入新 PIN 可覆盖）";
+      clearPinBtn.classList.remove("hidden");
+    } else {
+      masterPwdInput.placeholder = "输入主密码...";
+      pinInput.placeholder = "输入 4~8 位快捷 PIN 码";
+      clearPinBtn.classList.add("hidden");
+    }
     if (st.locked || !st.unlocked) {
       statusBadge.textContent = "WebDAV 云端模式 · 已锁定";
       statusBadge.className = "status err";
@@ -294,6 +306,32 @@ unlockBtn.onclick = async () => {
 masterPwdInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") unlockBtn.click();
 });
+
+savePinBtn.onclick = async () => {
+  const pin = (pinInput.value || "").trim();
+  if (pin.length < 4) {
+    davTestMsg.textContent = "快捷 PIN 码至少需要 4 位";
+    davTestMsg.className = "hint-msg err";
+    return;
+  }
+  const res = await sendBg({ type: "SET_WEBDAV_PIN", pin });
+  if (!res.ok) {
+    davTestMsg.textContent = res.error || "设置 PIN 失败";
+    davTestMsg.className = "hint-msg err";
+    return;
+  }
+  pinInput.value = "";
+  davTestMsg.textContent = "快捷 PIN 码已设置（下次可直接用 PIN 秒解）";
+  davTestMsg.className = "hint-msg ok";
+  await refresh();
+};
+
+clearPinBtn.onclick = async () => {
+  await sendBg({ type: "SET_WEBDAV_PIN", pin: "" });
+  davTestMsg.textContent = "已清除快捷 PIN 码";
+  davTestMsg.className = "hint-msg ok";
+  await refresh();
+};
 
 syncBtn.onclick = async () => {
   syncBtn.textContent = "…";

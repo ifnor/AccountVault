@@ -520,6 +520,16 @@ fn handle_connection(mut stream: TcpStream, app: &AppHandle) {
         return;
     }
 
+    if method == "POST" && path == "/api/focus" {
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.unminimize();
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        write_json_response(&mut stream, 200, "OK", cors_origin, r#"{"ok":true}"#);
+        return;
+    }
+
     if !is_unlocked {
         write_json_response(
             &mut stream,

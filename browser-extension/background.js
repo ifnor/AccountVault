@@ -89,6 +89,77 @@ async function getWebDavSession(idleMinutes) {
   return s;
 }
 
+function bytesToHex(u8) {
+  return Array.from(u8, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+async function derivePinKey(pin, saltBytes) {
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(pin),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: saltBytes, iterations: 100000, hash: "SHA-256" },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function savePinVault(pin, masterPassword) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await derivePinKey(pin, salt);
+  const cipher = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      key,
+      new TextEncoder().encode(masterPassword)
+    )
+  );
+  await chrome.storage.local.set({
+    av_pin_vault: {
+      saltHex: bytesToHex(salt),
+      ivHex: bytesToHex(iv),
+      cipherHex: bytesToHex(cipher)
+    }
+  });
+}
+
+async function hasPinVault() {
+  const data = await chrome.storage.local.get(["av_pin_vault"]);
+  return Boolean(data.av_pin_vault?.cipherHex);
+}
+
+async function tryDecryptMasterWithPin(pin) {
+  const data = await chrome.storage.local.get(["av_pin_vault"]);
+  const pv = data.av_pin_vault;
+  if (!pv?.saltHex || !pv?.ivHex || !pv?.cipherHex) return null;
+  try {
+    const key = await derivePinKey(pin, hexToBytes(pv.saltHex));
+    const plain = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: hexToBytes(pv.ivHex) },
+      key,
+      hexToBytes(pv.cipherHex)
+    );
+    return new TextDecoder().decode(plain);
+  } catch {
+    return null;
+  }
+}
+
 async function callBridge(path, options = {}) {
   const { port, token } = await getConfig();
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -388,13 +459,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     if (msg.type === "UNLOCK_WEBDAV") {
       try {
-        const res = await fetchWebDavRecords(cfg, msg.masterPassword || "");
+        const rawInput = msg.masterPassword || "";
+        const decryptedFromPin = await tryDecryptMasterWithPin(rawInput);
+        const realMaster = decryptedFromPin !== null ? decryptedFromPin : rawInput;
+        const res = await fetchWebDavRecords(cfg, realMaster);
         await chrome.storage.session.set({
           av_session: {
             records: res.records,
             keyHex: res.keyHex,
             saltHex: res.saltHex,
-            masterPassword: msg.masterPassword || "",
+            masterPassword: realMaster,
             versionTag: res.versionTag || "",
             lastSyncedAt: Date.now(),
             lastActiveAt: Date.now()
@@ -404,6 +478,29 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       } catch (e) {
         sendResponse({ ok: false, error: e?.message || String(e) });
       }
+      return;
+    }
+
+    if (msg.type === "SET_WEBDAV_PIN") {
+      const pin = (msg.pin || "").trim();
+      if (!pin) {
+        await chrome.storage.local.remove(["av_pin_vault"]);
+        sendResponse({ ok: true, hasPin: false });
+        return;
+      }
+      const sess = await getWebDavSession(cfg.idleMinutes);
+      if (!sess || !sess.masterPassword) {
+        sendResponse({ ok: false, error: "请先解锁保险库后再设置快捷 PIN 码" });
+        return;
+      }
+      await savePinVault(pin, sess.masterPassword);
+      sendResponse({ ok: true, hasPin: true });
+      return;
+    }
+
+    if (msg.type === "FOCUS_BRIDGE") {
+      const res = await callBridge("/api/focus", { method: "POST" });
+      sendResponse(res);
       return;
     }
 
@@ -443,6 +540,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           mode: "webdav",
           unlocked: Boolean(sess),
           locked: !sess,
+          hasPin: await hasPinVault(),
           count: sess ? sess.records.filter((r) => !r.deleted_at).length : 0
         });
         return;
@@ -471,7 +569,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (cfg.mode === "webdav") {
         let sess = await getWebDavSession(cfg.idleMinutes);
         if (!sess) {
-          sendResponse({ ok: false, mode: "webdav", locked: true, error: "WebDAV 保险库已锁定，请点击扩展图标输入主密码解锁" });
+          sendResponse({
+            ok: false,
+            mode: "webdav",
+            locked: true,
+            hasPin: await hasPinVault(),
+            error: "WebDAV 保险库已锁定，请解锁后填充"
+          });
           return;
         }
         sess = await syncWebDavSessionIfChanged(cfg, sess, false);
@@ -486,7 +590,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         method: "POST",
         body: { url: msg.url || "", domain: msg.domain || "" }
       });
-      sendResponse(res);
+      sendResponse({ mode: "bridge", ...res });
       return;
     }
 

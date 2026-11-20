@@ -152,6 +152,159 @@
     }
   }
 
+  function showInlineUnlockDropdown(anchorEl, mode, lockInfo) {
+    closeDropdown();
+    const rect = anchorEl.getBoundingClientRect();
+    const box = document.createElement("div");
+    box.style.cssText = `
+      position: fixed;
+      top: ${Math.min(window.innerHeight - 250, rect.bottom + 6)}px;
+      left: ${Math.max(8, Math.min(window.innerWidth - 300, rect.left))}px;
+      width: 290px;
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      border-radius: 10px;
+      box-shadow: 0 12px 28px rgba(15, 23, 42, 0.18);
+      z-index: 2147483647;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #0f172a;
+      padding: 10px;
+    `;
+
+    const header = document.createElement("div");
+    header.textContent =
+      lockInfo?.mode === "webdav"
+        ? "AccountVault 已锁定 (WebDAV)"
+        : "AccountVault 桌面端已锁定";
+    header.style.cssText =
+      "font-size:12px;font-weight:700;color:#0f172a;padding-bottom:6px;border-bottom:1px solid #f1f5f9;margin-bottom:8px;";
+    box.appendChild(header);
+
+    const retryFetch = () => {
+      chrome.runtime.sendMessage(
+        { type: "MATCH_CREDENTIALS", url: location.href, domain: location.hostname },
+        (mRes) => {
+          if (mRes && mRes.ok) {
+            showDropdown(anchorEl, mRes.items || [], null, mode);
+            if (typeof maybeShowTotpMiniWindow === "function") maybeShowTotpMiniWindow(true);
+          } else if (mRes && mRes.locked) {
+            showInlineUnlockDropdown(anchorEl, mode, mRes);
+          } else {
+            showDropdown(anchorEl, [], mRes?.error || "获取账号失败", mode);
+          }
+        }
+      );
+    };
+
+    if (lockInfo?.mode === "webdav") {
+      const tip = document.createElement("div");
+      tip.textContent = lockInfo.hasPin
+        ? "输入快捷 PIN 码或主密码，解锁后立即显示账号："
+        : "输入同步主密码，解锁后立即显示账号：";
+      tip.style.cssText = "font-size:11px;color:#64748b;margin-bottom:6px;line-height:1.4;";
+      box.appendChild(tip);
+
+      const pwdInput = document.createElement("input");
+      pwdInput.type = "password";
+      pwdInput.placeholder = lockInfo.hasPin ? "PIN 码或主密码" : "输入同步主密码";
+      pwdInput.style.cssText = `
+        width:100%;box-sizing:border-box;height:32px;padding:0 9px;
+        border:1px solid #cbd5e1;border-radius:7px;font-size:12px;
+        outline:none;background:#f8fafc;color:#0f172a;margin-bottom:6px;
+      `;
+      box.appendChild(pwdInput);
+
+      const errEl = document.createElement("div");
+      errEl.style.cssText = "font-size:11px;color:#dc2626;min-height:14px;margin-bottom:6px;display:none;";
+      box.appendChild(errEl);
+
+      const submitBtn = document.createElement("button");
+      submitBtn.type = "button";
+      submitBtn.textContent = "解锁并显示账号";
+      submitBtn.style.cssText = `
+        width:100%;height:32px;border:none;border-radius:7px;
+        background:linear-gradient(135deg,#1b7ef5,#4d3fe4);color:#fff;
+        font-size:12px;font-weight:600;cursor:pointer;
+      `;
+      const doUnlock = () => {
+        const val = pwdInput.value;
+        if (!val) {
+          errEl.textContent = "请输入密码或 PIN 码";
+          errEl.style.display = "block";
+          return;
+        }
+        submitBtn.disabled = true;
+        submitBtn.textContent = "解密中...";
+        errEl.style.display = "none";
+        chrome.runtime.sendMessage({ type: "UNLOCK_WEBDAV", masterPassword: val }, (uRes) => {
+          submitBtn.disabled = false;
+          submitBtn.textContent = "解锁并显示账号";
+          if (!uRes || !uRes.ok) {
+            errEl.textContent = uRes?.error || "解锁失败，请检查密码或 PIN";
+            errEl.style.display = "block";
+            return;
+          }
+          retryFetch();
+        });
+      };
+      submitBtn.onclick = doUnlock;
+      pwdInput.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          doUnlock();
+        }
+      });
+      box.appendChild(submitBtn);
+      setTimeout(() => pwdInput.focus(), 30);
+    } else {
+      const tip = document.createElement("div");
+      tip.textContent = "请先在桌面端 AccountVault 解锁保险库，完成后点击下方重试。";
+      tip.style.cssText = "font-size:11px;color:#64748b;margin-bottom:8px;line-height:1.4;";
+      box.appendChild(tip);
+
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;gap:6px;";
+
+      const wakeBtn = document.createElement("button");
+      wakeBtn.type = "button";
+      wakeBtn.textContent = "唤醒桌面端";
+      wakeBtn.style.cssText = `
+        flex:1;height:30px;border:none;border-radius:7px;
+        background:linear-gradient(135deg,#1b7ef5,#4d3fe4);color:#fff;
+        font-size:11px;font-weight:600;cursor:pointer;
+      `;
+      wakeBtn.onclick = () => {
+        chrome.runtime.sendMessage({ type: "FOCUS_BRIDGE" }, () => {});
+        wakeBtn.textContent = "已发送唤醒";
+      };
+
+      const retryBtn = document.createElement("button");
+      retryBtn.type = "button";
+      retryBtn.textContent = "已解锁，重试";
+      retryBtn.style.cssText = `
+        flex:1;height:30px;border:1px solid #cbd5e1;border-radius:7px;
+        background:#ffffff;color:#0f172a;font-size:11px;font-weight:600;cursor:pointer;
+      `;
+      retryBtn.onclick = retryFetch;
+
+      row.appendChild(wakeBtn);
+      row.appendChild(retryBtn);
+      box.appendChild(row);
+    }
+
+    document.body.appendChild(box);
+    activeDropdown = box;
+    setTimeout(() => {
+      const onOutside = (ev) => {
+        if (activeDropdown && !activeDropdown.contains(ev.target) && ev.target !== anchorEl) {
+          closeDropdown();
+          document.removeEventListener("mousedown", onOutside, true);
+        }
+      };
+      document.addEventListener("mousedown", onOutside, true);
+    }, 0);
+  }
+
   function showDropdown(anchorEl, items, message, mode = "login") {
     closeDropdown();
     const rect = anchorEl.getBoundingClientRect();
@@ -298,7 +451,7 @@
           if (!res || res.offline) {
             showDropdown(input, [], "未连接到桌面端 AccountVault，或请在扩展图标中切换为 WebDAV 模式。", mode);
           } else if (res.locked) {
-            showDropdown(input, [], "AccountVault 已锁定，请先解锁后再填充。", mode);
+            showInlineUnlockDropdown(input, mode, res);
           } else if (res.error) {
             showDropdown(input, [], res.error, mode);
           } else {
@@ -638,6 +791,119 @@
     });
   }
 
+  function showWebDavUnlockModal(hasPin) {
+    return new Promise((resolve) => {
+      const existing = document.getElementById("av-passkey-host");
+      if (existing) existing.remove();
+
+      const host = document.createElement("div");
+      host.id = "av-passkey-host";
+      const shadow = host.attachShadow({ mode: "closed" });
+
+      const style = document.createElement("style");
+      style.textContent = `
+        :host { all: initial; }
+        .overlay {
+          position: fixed; inset: 0; z-index: 2147483647;
+          background: rgba(15, 23, 42, 0.45);
+          backdrop-filter: blur(4px);
+          display: flex; align-items: center; justify-content: center;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        .card {
+          width: 370px; max-width: calc(100vw - 32px);
+          background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px;
+          box-shadow: 0 24px 54px rgba(15, 23, 42, 0.32); padding: 18px 20px; color: #0f172a;
+        }
+        .head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+        .logo { width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0; }
+        .title { font-size: 15px; font-weight: 700; color: #0f172a; }
+        .sub { font-size: 12px; color: #64748b; margin-top: 2px; }
+        .inp {
+          width: 100%; box-sizing: border-box; height: 38px; padding: 0 11px;
+          border: 1px solid #cbd5e1; border-radius: 9px; font-size: 13px;
+          outline: none; background: #f8fafc; color: #0f172a; margin-bottom: 6px;
+        }
+        .inp:focus { border-color: #2563eb; background: #ffffff; }
+        .err { font-size: 12px; color: #dc2626; min-height: 16px; margin-bottom: 6px; }
+        .actions { display: flex; justify-content: flex-end; gap: 10px; }
+        .btn { height: 36px; padding: 0 14px; border-radius: 9px; font-size: 12px; font-weight: 600; cursor: pointer; }
+        .btn-sec { background: #ffffff; border: 1px solid #cbd5e1; color: #475569; }
+        .btn-pri { background: linear-gradient(135deg, #1b7ef5, #4d3fe4); border: none; color: #ffffff; }
+      `;
+      shadow.appendChild(style);
+
+      const overlay = document.createElement("div");
+      overlay.className = "overlay";
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML = `
+        <div class="head">
+          <img class="logo" src="${chrome.runtime.getURL("icons/icon128.png")}" />
+          <div>
+            <div class="title">解锁 AccountVault</div>
+            <div class="sub">${hasPin ? "输入快捷 PIN 码或主密码以继续操作" : "输入同步主密码以继续操作"}</div>
+          </div>
+        </div>
+      `;
+      const inp = document.createElement("input");
+      inp.type = "password";
+      inp.className = "inp";
+      inp.placeholder = hasPin ? "PIN 码或主密码" : "输入同步主密码";
+      const err = document.createElement("div");
+      err.className = "err";
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      const cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.className = "btn btn-sec";
+      cancelBtn.textContent = "改用系统原生";
+      cancelBtn.onclick = () => {
+        host.remove();
+        resolve(false);
+      };
+      const okBtn = document.createElement("button");
+      okBtn.type = "button";
+      okBtn.className = "btn btn-pri";
+      okBtn.textContent = "解锁并继续";
+      const doUnlock = () => {
+        if (!inp.value) {
+          err.textContent = "请输入密码或 PIN 码";
+          return;
+        }
+        okBtn.disabled = true;
+        okBtn.textContent = "解密中...";
+        err.textContent = "";
+        chrome.runtime.sendMessage({ type: "UNLOCK_WEBDAV", masterPassword: inp.value }, (res) => {
+          okBtn.disabled = false;
+          okBtn.textContent = "解锁并继续";
+          if (!res || !res.ok) {
+            err.textContent = res?.error || "解锁失败";
+            return;
+          }
+          host.remove();
+          resolve(true);
+        });
+      };
+      okBtn.onclick = doUnlock;
+      inp.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          doUnlock();
+        }
+      });
+      actions.appendChild(cancelBtn);
+      actions.appendChild(okBtn);
+      card.appendChild(inp);
+      card.appendChild(err);
+      card.appendChild(actions);
+      overlay.appendChild(card);
+      shadow.appendChild(overlay);
+      document.documentElement.appendChild(host);
+      setTimeout(() => inp.focus(), 40);
+    });
+  }
+
   window.addEventListener("message", (ev) => {
     if (ev.source !== window || !ev.data || ev.data.type !== "AV_WEBAUTHN_REQ") return;
     const { reqId, action, payload } = ev.data;
@@ -646,10 +912,22 @@
     };
 
     if (action === "CREATE_PROMPT") {
-      chrome.runtime.sendMessage({ type: "GET_STATUS" }, (st) => {
-        if (!st || !st.ok || st.offline || st.locked || st.needToken || st.needWebDavConfig) {
+      chrome.runtime.sendMessage({ type: "GET_STATUS" }, async (st) => {
+        if (!st || !st.ok || st.offline || st.needToken || st.needWebDavConfig) {
           reply({ fallback: true });
           return;
+        }
+        if (st.locked) {
+          if (st.mode === "webdav") {
+            const unlockedNow = await showWebDavUnlockModal(Boolean(st.hasPin));
+            if (!unlockedNow) {
+              reply({ fallback: true });
+              return;
+            }
+          } else {
+            reply({ fallback: true });
+            return;
+          }
         }
         const proceedPrompt = () => {
           chrome.runtime.sendMessage({ type: "GET_CONFIG" }, async (cfg) => {
