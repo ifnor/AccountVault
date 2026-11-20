@@ -50,7 +50,7 @@ import AccountListPane from "./components/AccountListPane.vue";
 import AccountDetailPane from "./components/AccountDetailPane.vue";
 import MobileTabBar from "./components/MobileTabBar.vue";
 
-const appVersion = ref(pkg.version || "1.1.5");
+const appVersion = ref(pkg.version || "1.1.6");
 const { toasts, notify } = useToast();
 const { confirmState } = useConfirm();
 const {
