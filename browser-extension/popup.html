@@ -10,19 +10,33 @@
     <header class="header">
       <div class="brand">
         <img src="icons/icon128.png" alt="AV" class="logo" />
-        <div>
-          <div class="title">AccountVault</div>
+        <div class="brand-meta">
+          <div class="title-row">
+            <span class="title">AccountVault</span>
+            <span id="ext-ver-chip" class="ver-chip">v1.1.5</span>
+          </div>
           <div id="status-badge" class="status">检查状态中...</div>
         </div>
       </div>
       <div class="header-actions">
-        <button id="sync-btn" class="icon-btn hidden" title="同步云端">↻</button>
-        <button id="lock-btn" class="icon-btn hidden" title="锁定保险库">🔒</button>
-        <button id="toggle-settings" class="icon-btn" title="连接模式与设置">⚙</button>
+        <button id="sync-btn" class="icon-btn hidden" title="同步云端">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
+        </button>
+        <button id="lock-btn" class="icon-btn hidden" title="锁定保险库">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        </button>
+        <button id="toggle-about" class="icon-btn" title="关于与检查更新">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+          <span id="update-dot" class="dot hidden"></span>
+        </button>
+        <button id="toggle-settings" class="icon-btn" title="连接模式与设置">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+        </button>
       </div>
     </header>
 
     <div id="settings-panel" class="panel hidden">
+      <div class="panel-head">连接与安全设置</div>
       <label class="label">连接模式</label>
       <div class="mode-tabs">
         <button id="mode-bridge-btn" type="button" class="mode-tab">本地桌面桥接</button>
@@ -43,13 +57,17 @@
         <input id="dav-user-input" type="text" class="input" placeholder="用户名 / 邮箱" />
         <label class="label">WebDAV 应用密码</label>
         <input id="dav-pass-input" type="password" class="input" placeholder="应用密码" />
-        <label class="label">空闲自动锁定（分钟，0 为关闭，关闭浏览器自动锁）</label>
+        <label class="label">空闲自动锁定（分钟，0 为不自动锁定）</label>
         <input id="idle-input" type="number" class="input" value="30" min="0" />
+        <label class="check-row" title="开启后即使关闭并重新打开浏览器，也会自动恢复已解锁状态（仅建议在个人专属电脑开启）">
+          <input id="keep-unlocked-input" type="checkbox" />
+          <span>重启浏览器保持解锁（仅限受信任个人电脑）</span>
+        </label>
         <label class="label">快捷 PIN 码解锁（需先解锁后设置）</label>
-        <div style="display:flex;gap:6px;align-items:center;">
+        <div class="inline-row">
           <input id="pin-input" type="password" class="input" placeholder="输入 4~8 位快捷 PIN 码" style="flex:1;margin-bottom:0;" />
-          <button id="save-pin-btn" type="button" class="btn" style="height:34px;padding:0 10px;">设置 PIN</button>
-          <button id="clear-pin-btn" type="button" class="btn hidden" style="height:34px;padding:0 10px;">清除</button>
+          <button id="save-pin-btn" type="button" class="btn">设置 PIN</button>
+          <button id="clear-pin-btn" type="button" class="btn hidden">清除</button>
         </div>
         <div id="dav-test-msg" class="hint-msg"></div>
       </div>
@@ -66,24 +84,53 @@
       </div>
     </div>
 
-    <div id="unlock-panel" class="panel hidden">
-      <div class="unlock-title">解锁 WebDAV 云端保险库</div>
-      <div class="unlock-desc">主密码仅用于本地 Scrypt + AES-256-GCM 解密，不会上传或明文保存。</div>
-      <input id="master-pwd-input" type="password" class="input" placeholder="输入主密码..." />
-      <div id="unlock-err" class="hint-msg err"></div>
-      <label class="label">Passkey 弹窗样式</label>
-      <div class="mode-tabs">
-        <button id="style-window-btn" type="button" class="mode-tab">独立窗口弹窗</button>
-        <button id="style-overlay-btn" type="button" class="mode-tab">页面悬浮卡片</button>
+    <div id="about-panel" class="panel hidden">
+      <div class="about-hero">
+        <img src="icons/icon128.png" alt="AccountVault" class="about-logo" />
+        <div>
+          <div class="about-name">AccountVault 密码助手</div>
+          <div id="about-version" class="about-ver">当前版本：v1.1.5</div>
+        </div>
       </div>
 
+      <div class="about-desc">
+        开源本地优先、零知识加密的密码管理、2FA 动态口令与 FIDO2 / Passkey 通行密钥扩展。
+      </div>
+
+      <div class="update-box">
+        <div class="update-row">
+          <span id="update-status-text" class="update-text">点击下方按钮检查 GitHub 最新版本</span>
+        </div>
+        <div id="update-notes" class="update-notes hidden"></div>
+        <div class="update-actions">
+          <button id="check-update-btn" type="button" class="btn primary">检查更新</button>
+          <button id="open-release-btn" type="button" class="btn hidden">前往下载新版</button>
+        </div>
+        <div class="update-tip">商店安装版本将由 Edge / Chrome 后台自动推送更新。</div>
+      </div>
+
+      <div class="about-links">
+        <button id="link-github" type="button" class="link-btn">GitHub 仓库</button>
+        <button id="link-privacy" type="button" class="link-btn">隐私政策</button>
+        <button id="link-issues" type="button" class="link-btn">问题反馈</button>
+      </div>
+    </div>
+
+    <div id="unlock-panel" class="panel hidden">
+      <div class="unlock-title">解锁 WebDAV 云端保险库</div>
+      <div class="unlock-desc">主密码仅用于本地 PBKDF2 + AES-256-GCM 解密，不会上传或明文保存。</div>
+      <input id="master-pwd-input" type="password" class="input" placeholder="输入主密码..." />
+      <div id="unlock-err" class="hint-msg err"></div>
       <div class="row-actions">
-        <button id="unlock-btn" type="button" class="btn primary">解锁并同步</button>
+        <button id="unlock-btn" type="button" class="btn primary" style="width:100%;height:34px;">解锁并同步</button>
       </div>
     </div>
 
     <div id="main-panel">
-      <input id="search-input" type="text" class="search" placeholder="搜索全部账号 / 网站..." />
+      <div class="search-wrap">
+        <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+        <input id="search-input" type="text" class="search" placeholder="搜索全部账号 / 网站..." />
+      </div>
       <div id="section-label" class="section-label">当前网站匹配</div>
       <div id="list" class="list"></div>
     </div>

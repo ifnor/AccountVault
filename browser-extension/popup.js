@@ -1,8 +1,21 @@
 const statusBadge = document.getElementById("status-badge");
+const extVerChip = document.getElementById("ext-ver-chip");
 const settingsPanel = document.getElementById("settings-panel");
+const aboutPanel = document.getElementById("about-panel");
 const toggleSettingsBtn = document.getElementById("toggle-settings");
+const toggleAboutBtn = document.getElementById("toggle-about");
+const updateDot = document.getElementById("update-dot");
 const syncBtn = document.getElementById("sync-btn");
 const lockBtn = document.getElementById("lock-btn");
+
+const aboutVersionEl = document.getElementById("about-version");
+const updateStatusText = document.getElementById("update-status-text");
+const updateNotesEl = document.getElementById("update-notes");
+const checkUpdateBtn = document.getElementById("check-update-btn");
+const openReleaseBtn = document.getElementById("open-release-btn");
+const linkGithubBtn = document.getElementById("link-github");
+const linkPrivacyBtn = document.getElementById("link-privacy");
+const linkIssuesBtn = document.getElementById("link-issues");
 
 const modeBridgeBtn = document.getElementById("mode-bridge-btn");
 const modeWebDavBtn = document.getElementById("mode-webdav-btn");
@@ -17,6 +30,7 @@ const davUrlInput = document.getElementById("dav-url-input");
 const davUserInput = document.getElementById("dav-user-input");
 const davPassInput = document.getElementById("dav-pass-input");
 const idleInput = document.getElementById("idle-input");
+const keepUnlockedInput = document.getElementById("keep-unlocked-input");
 const pinInput = document.getElementById("pin-input");
 const savePinBtn = document.getElementById("save-pin-btn");
 const clearPinBtn = document.getElementById("clear-pin-btn");
@@ -235,7 +249,20 @@ async function refresh() {
   }
 }
 
-toggleSettingsBtn.onclick = () => settingsPanel.classList.toggle("hidden");
+toggleSettingsBtn.onclick = () => {
+  const willOpen = settingsPanel.classList.contains("hidden");
+  aboutPanel.classList.add("hidden");
+  toggleAboutBtn.classList.remove("active");
+  settingsPanel.classList.toggle("hidden", !willOpen);
+  toggleSettingsBtn.classList.toggle("active", willOpen);
+};
+toggleAboutBtn.onclick = () => {
+  const willOpen = aboutPanel.classList.contains("hidden");
+  settingsPanel.classList.add("hidden");
+  toggleSettingsBtn.classList.remove("active");
+  aboutPanel.classList.toggle("hidden", !willOpen);
+  toggleAboutBtn.classList.toggle("active", willOpen);
+};
 modeBridgeBtn.onclick = () => setModeUI("bridge");
 modeWebDavBtn.onclick = () => setModeUI("webdav");
 styleWindowBtn.onclick = () => setPromptStyleUI("window");
@@ -273,6 +300,7 @@ saveConfigBtn.onclick = async () => {
     webdavUser: davUserInput.value,
     webdavPass: davPassInput.value,
     idleMinutes: idleInput.value,
+    keepUnlocked: keepUnlockedInput.checked,
     promptStyle: editingPromptStyle
   });
   settingsPanel.classList.add("hidden");
@@ -334,9 +362,11 @@ clearPinBtn.onclick = async () => {
 };
 
 syncBtn.onclick = async () => {
-  syncBtn.textContent = "…";
+  syncBtn.disabled = true;
+  syncBtn.style.opacity = "0.5";
   await sendBg({ type: "SYNC_WEBDAV" });
-  syncBtn.textContent = "↻";
+  syncBtn.style.opacity = "";
+  syncBtn.disabled = false;
   await refresh();
 };
 
@@ -345,9 +375,78 @@ lockBtn.onclick = async () => {
   await refresh();
 };
 
+let latestReleaseUrl = "https://github.com/ifnor/AccountVault/releases/latest";
+
+function compareSemver(a, b) {
+  const pa = String(a || "0").replace(/^v/i, "").split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || "0").replace(/^v/i, "").split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return 1;
+    if ((pa[i] || 0) < (pb[i] || 0)) return -1;
+  }
+  return 0;
+}
+
+checkUpdateBtn.onclick = async () => {
+  const currentVer = chrome.runtime.getManifest().version || "1.0.0";
+  checkUpdateBtn.disabled = true;
+  checkUpdateBtn.textContent = "检查中...";
+  updateStatusText.className = "update-text";
+  updateStatusText.textContent = "正在连接 GitHub Releases...";
+  updateNotesEl.classList.add("hidden");
+  openReleaseBtn.classList.add("hidden");
+
+  try {
+    const granted = await chrome.permissions.request({ origins: ["https://api.github.com/*"] });
+    if (!granted) {
+      updateStatusText.className = "update-text err";
+      updateStatusText.textContent = "未授予 GitHub API 访问权限，无法在线检查";
+      return;
+    }
+    const resp = await fetch("https://api.github.com/repos/ifnor/AccountVault/releases/latest", {
+      headers: { Accept: "application/vnd.github+json" }
+    });
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    const latestTag = data.tag_name || data.name || "";
+    latestReleaseUrl = data.html_url || latestReleaseUrl;
+
+    if (latestTag && compareSemver(latestTag, currentVer) > 0) {
+      updateStatusText.className = "update-text new";
+      updateStatusText.textContent = `发现新版本：${latestTag}（当前 v${currentVer}）`;
+      updateDot.classList.remove("hidden");
+      openReleaseBtn.classList.remove("hidden");
+      if (data.body) {
+        updateNotesEl.textContent = data.body.trim().slice(0, 600);
+        updateNotesEl.classList.remove("hidden");
+      }
+    } else {
+      updateStatusText.className = "update-text new";
+      updateStatusText.textContent = `当前已是最新版本 (v${currentVer})`;
+      updateDot.classList.add("hidden");
+    }
+  } catch (e) {
+    updateStatusText.className = "update-text err";
+    updateStatusText.textContent = `检查更新失败: ${e?.message || e}`;
+  } finally {
+    checkUpdateBtn.disabled = false;
+    checkUpdateBtn.textContent = "检查更新";
+  }
+};
+
+openReleaseBtn.onclick = () => chrome.tabs.create({ url: latestReleaseUrl });
+linkGithubBtn.onclick = () => chrome.tabs.create({ url: "https://github.com/ifnor/AccountVault" });
+linkPrivacyBtn.onclick = () => chrome.tabs.create({ url: "https://github.com/ifnor/AccountVault/blob/main/PRIVACY.md" });
+linkIssuesBtn.onclick = () => chrome.tabs.create({ url: "https://github.com/ifnor/AccountVault/issues" });
+
 searchInput.addEventListener("input", () => refresh());
 
 (async () => {
+  const ver = chrome.runtime.getManifest().version || "1.1.5";
+  extVerChip.textContent = `v${ver}`;
+  aboutVersionEl.textContent = `当前版本：v${ver}`;
   const cfg = await sendBg({ type: "GET_CONFIG" });
   setModeUI(cfg.mode || "bridge");
   setPromptStyleUI(cfg.promptStyle || "window");
@@ -357,5 +456,6 @@ searchInput.addEventListener("input", () => refresh());
   davUserInput.value = cfg.webdavUser || "";
   davPassInput.value = cfg.webdavPass || "";
   idleInput.value = cfg.idleMinutes !== undefined ? cfg.idleMinutes : 30;
+  keepUnlockedInput.checked = Boolean(cfg.keepUnlocked);
   await refresh();
 })();

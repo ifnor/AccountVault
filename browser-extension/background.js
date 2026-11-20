@@ -34,6 +34,7 @@ async function getConfig() {
     "av_webdav_user",
     "av_webdav_pass",
     "av_idle_minutes",
+    "av_keep_unlocked",
     "av_prompt_style"
   ]);
   return {
@@ -44,6 +45,7 @@ async function getConfig() {
     webdavUser: (data.av_webdav_user || "").trim(),
     webdavPass: data.av_webdav_pass || "",
     idleMinutes: data.av_idle_minutes !== undefined ? Number(data.av_idle_minutes) : DEFAULT_IDLE_MIN,
+    keepUnlocked: Boolean(data.av_keep_unlocked),
     promptStyle: data.av_prompt_style === "overlay" ? "overlay" : "window"
   };
 }
@@ -76,12 +78,69 @@ function webdavHeaders(cfg) {
   };
 }
 
+async function clearPersistedSession() {
+  await chrome.storage.local.remove(["av_persisted_session", "av_wrap_jwk"]);
+}
+
+async function persistSessionEncrypted(sessObj) {
+  const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+  const jwk = await crypto.subtle.exportKey("jwk", key);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cipher = new Uint8Array(
+    await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      key,
+      new TextEncoder().encode(JSON.stringify(sessObj))
+    )
+  );
+  await chrome.storage.local.set({
+    av_wrap_jwk: jwk,
+    av_persisted_session: {
+      ivHex: bytesToHex(iv),
+      cipherHex: bytesToHex(cipher)
+    }
+  });
+}
+
+async function loadPersistedSessionEncrypted() {
+  const data = await chrome.storage.local.get(["av_wrap_jwk", "av_persisted_session"]);
+  const jwk = data.av_wrap_jwk;
+  const ps = data.av_persisted_session;
+  if (!jwk || !ps?.ivHex || !ps?.cipherHex) return null;
+  try {
+    const key = await crypto.subtle.importKey("jwk", jwk, { name: "AES-GCM" }, false, ["decrypt"]);
+    const plain = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: hexToBytes(ps.ivHex) },
+      key,
+      hexToBytes(ps.cipherHex)
+    );
+    return JSON.parse(new TextDecoder().decode(plain));
+  } catch {
+    return null;
+  }
+}
+
+async function saveWebDavSession(sessObj) {
+  await chrome.storage.session.set({ av_session: sessObj });
+  const data = await chrome.storage.local.get(["av_keep_unlocked"]);
+  if (data.av_keep_unlocked) {
+    await persistSessionEncrypted(sessObj);
+  }
+}
+
 async function getWebDavSession(idleMinutes) {
   const sess = await chrome.storage.session.get(["av_session"]);
-  const s = sess.av_session;
+  let s = sess.av_session;
+  if (!s) {
+    const data = await chrome.storage.local.get(["av_keep_unlocked"]);
+    if (data.av_keep_unlocked) {
+      s = await loadPersistedSessionEncrypted();
+    }
+  }
   if (!s) return null;
   if (idleMinutes > 0 && Date.now() - (s.lastActiveAt || 0) > idleMinutes * 60 * 1000) {
     await chrome.storage.session.remove(["av_session"]);
+    await clearPersistedSession();
     return null;
   }
   s.lastActiveAt = Date.now();
@@ -305,7 +364,7 @@ async function syncWebDavSessionIfChanged(cfg, sess, force = false) {
           const curTag = `${etag}|${lastMod}|${contentLen}`;
           if (curTag && curTag !== "||" && curTag === sess.versionTag) {
             sess.lastSyncedAt = Date.now();
-            await chrome.storage.session.set({ av_session: sess });
+            await saveWebDavSession(sess);
             return sess;
           }
         }
@@ -318,7 +377,7 @@ async function syncWebDavSessionIfChanged(cfg, sess, force = false) {
       sess.saltHex = remote.saltHex;
       sess.versionTag = remote.versionTag;
       sess.lastSyncedAt = Date.now();
-      await chrome.storage.session.set({ av_session: sess });
+      await saveWebDavSession(sess);
       return sess;
     } catch {
       return sess;
@@ -353,6 +412,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
 
     if (msg.type === "SET_CONFIG") {
+      const keepUnlocked = Boolean(msg.keepUnlocked);
       await chrome.storage.local.set({
         av_mode: msg.mode === "webdav" ? "webdav" : "bridge",
         av_port: Number(msg.port) || DEFAULT_PORT,
@@ -361,8 +421,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         av_webdav_user: (msg.webdavUser || "").trim(),
         av_webdav_pass: msg.webdavPass !== undefined ? msg.webdavPass : cfg.webdavPass,
         av_idle_minutes: msg.idleMinutes !== undefined ? Number(msg.idleMinutes) : cfg.idleMinutes,
+        av_keep_unlocked: keepUnlocked,
         av_prompt_style: msg.promptStyle === "overlay" ? "overlay" : "window"
       });
+      if (!keepUnlocked) {
+        await clearPersistedSession();
+      } else {
+        const cur = await chrome.storage.session.get(["av_session"]);
+        if (cur.av_session) {
+          await persistSessionEncrypted(cur.av_session);
+        }
+      }
       sendResponse({ ok: true });
       return;
     }
@@ -463,16 +532,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const decryptedFromPin = await tryDecryptMasterWithPin(rawInput);
         const realMaster = decryptedFromPin !== null ? decryptedFromPin : rawInput;
         const res = await fetchWebDavRecords(cfg, realMaster);
-        await chrome.storage.session.set({
-          av_session: {
-            records: res.records,
-            keyHex: res.keyHex,
-            saltHex: res.saltHex,
-            masterPassword: realMaster,
-            versionTag: res.versionTag || "",
-            lastSyncedAt: Date.now(),
-            lastActiveAt: Date.now()
-          }
+        await saveWebDavSession({
+          records: res.records,
+          keyHex: res.keyHex,
+          saltHex: res.saltHex,
+          masterPassword: realMaster,
+          versionTag: res.versionTag || "",
+          lastSyncedAt: Date.now(),
+          lastActiveAt: Date.now()
         });
         sendResponse({ ok: true, count: res.records.filter((r) => !r.deleted_at).length });
       } catch (e) {
@@ -506,6 +573,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     if (msg.type === "LOCK_WEBDAV") {
       await chrome.storage.session.remove(["av_session"]);
+      await clearPersistedSession();
       sendResponse({ ok: true });
       return;
     }
@@ -708,7 +776,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           sess.keyHex = keyHex;
           sess.saltHex = saltHex;
           sess.lastActiveAt = Date.now();
-          await chrome.storage.session.set({ av_session: sess });
+          await saveWebDavSession(sess);
 
           sendResponse({ ok: true });
         } catch (e) {
@@ -857,7 +925,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           sess.keyHex = keyHex;
           sess.saltHex = saltHex;
           sess.lastActiveAt = Date.now();
-          await chrome.storage.session.set({ av_session: sess });
+          await saveWebDavSession(sess);
           sendResponse({ ok: true });
         } catch (e) {
           sendResponse({ ok: false, error: e?.message || String(e) });
@@ -895,7 +963,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
               break;
             }
           }
-          await chrome.storage.session.set({ av_session: sess });
+          await saveWebDavSession(sess);
         }
         sendResponse({ ok: true });
         return;
