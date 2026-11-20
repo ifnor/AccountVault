@@ -288,12 +288,11 @@ pub fn smart_merge_records(
     let mut merged: Vec<AccountRecord> = map
         .into_values()
         .filter(|r| {
-            if let Some(del_ts) = r.deleted_at {
-                if del_ts > 1_000_000_000_000 && now_ms - del_ts > thirty_days_ms {
+            if let Some(del_ts) = r.deleted_at
+                && del_ts > 1_000_000_000_000 && now_ms - del_ts > thirty_days_ms {
                     needs_upload = true;
                     return false;
                 }
-            }
             true
         })
         .collect();

@@ -431,7 +431,7 @@ async fn upload_webdav_vault(
             .ok_or("保险库已锁定，无法上传")?
     };
     let current_records = state.records.read().clone();
-    let vault_key_copy = state.vault_key.read().clone();
+    let vault_key_copy = *state.vault_key.read();
     let _ = webdav::upload_vault(&config, &current_records, &password, vault_key_copy.as_ref())
         .await?;
     Ok(())
@@ -463,7 +463,7 @@ async fn sync_webdav_smart(
     };
 
     let current_records = state.records.read().clone();
-    let vault_key_copy = state.vault_key.read().clone();
+    let vault_key_copy = *state.vault_key.read();
 
     let (res, new_records_opt) = webdav::smart_sync_vault(
         &mut config,
@@ -805,9 +805,9 @@ fn build_localhost_callback_html(callback_url: &str, account_label: &str) -> Str
                 break;
             }
         }
-        if code_param.is_empty() {
-            if let Some(frag) = parsed.fragment() {
-                if let Ok(frag_url) = tauri::Url::parse(&format!("http://localhost/?{frag}")) {
+        if code_param.is_empty()
+            && let Some(frag) = parsed.fragment()
+                && let Ok(frag_url) = tauri::Url::parse(&format!("http://localhost/?{frag}")) {
                     for (k, v) in frag_url.query_pairs() {
                         if (k == "code" || k == "access_token") && !v.is_empty() {
                             code_param = v.to_string();
@@ -815,8 +815,6 @@ fn build_localhost_callback_html(callback_url: &str, account_label: &str) -> Str
                         }
                     }
                 }
-            }
-        }
     }
 
     let safe_url_html = html_escape(callback_url);
@@ -1068,8 +1066,8 @@ fn trigger_localhost_callback_in_background(
 
         let local_ok = if let Ok(client) = client_res {
             let mut ok = false;
-            if let Ok(mut parsed) = tauri::Url::parse(&callback_url) {
-                if parsed
+            if let Ok(mut parsed) = tauri::Url::parse(&callback_url)
+                && parsed
                     .host_str()
                     .map(|h| h.eq_ignore_ascii_case("localhost"))
                     .unwrap_or(false)
@@ -1078,8 +1076,8 @@ fn trigger_localhost_callback_in_background(
                         Some(p) => format!("localhost:{p}"),
                         None => "localhost".to_string(),
                     };
-                    if parsed.set_host(Some("127.0.0.1")).is_ok() {
-                        if client
+                    if parsed.set_host(Some("127.0.0.1")).is_ok()
+                        && client
                             .get(parsed.as_str())
                             .header("Host", host_header)
                             .send()
@@ -1088,9 +1086,7 @@ fn trigger_localhost_callback_in_background(
                         {
                             ok = true;
                         }
-                    }
                 }
-            }
             if !ok {
                 ok = client.get(&callback_url).send().await.is_ok();
             }
@@ -1161,7 +1157,7 @@ fn attach_webview2_localhost_interceptor(
                             || uri_str.contains("storagerelay%3A")
                             || uri_str.contains("storagerelay:");
                         if !needs_opener {
-                            let _ = args.SetHandled(true.into());
+                            let _ = args.SetHandled(true);
                             if let Some(wv) = wv {
                                 let wide_uri: Vec<u16> =
                                     uri_str.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1228,8 +1224,8 @@ fn attach_webview2_localhost_interceptor(
                                 true,
                             );
                         }
-                        if let Ok(ref env) = env_res {
-                            if let Some(stream) = SHCreateMemStream(Some(b"ok")) {
+                        if let Ok(ref env) = env_res
+                            && let Some(stream) = SHCreateMemStream(Some(b"ok")) {
                                 let status_wide: Vec<u16> = "OK".encode_utf16().chain(std::iter::once(0)).collect();
                                 let headers_wide: Vec<u16> = "Content-Type: text/plain\r\nCache-Control: no-store"
                                     .encode_utf16()
@@ -1244,7 +1240,6 @@ fn attach_webview2_localhost_interceptor(
                                     let _ = args.SetResponse(&resp);
                                 }
                             }
-                        }
                         return Ok(());
                     }
 
@@ -1324,6 +1319,7 @@ fn build_session_label(session_key: &str) -> String {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn open_in_app_browser(
     _app: tauri::AppHandle,
     session_key: String,
@@ -2174,7 +2170,7 @@ async fn open_in_app_browser(
         #[cfg(target_os = "windows")]
         attach_webview2_localhost_interceptor(&_window, display_name, initial_localhost_url);
         #[cfg(debug_assertions)]
-        let _ = _window.open_devtools();
+        _window.open_devtools();
         Ok(())
     }
 }
@@ -2260,7 +2256,8 @@ mod takeover_engine {
         let candidate_slice = if let Some(idx) = lower.find("--single-argument") {
             let after = &text[idx + "--single-argument".len()..];
             after.trim().trim_matches(|c| c == '"' || c == '\'')
-        } else if let Some(idx) = lower.find("https://").or_else(|| lower.find("http://")) {
+        } else {
+            let idx = lower.find("https://").or_else(|| lower.find("http://"))?;
             let rest = &text[idx..];
             let end = rest
                 .find(|c: char| {
@@ -2268,8 +2265,6 @@ mod takeover_engine {
                 })
                 .unwrap_or(rest.len());
             &rest[..end]
-        } else {
-            return None;
         };
 
         let unescaped = candidate_slice.replace("^&", "&");
@@ -2303,11 +2298,10 @@ mod takeover_engine {
     }
 
     pub fn set_captured_url(url: String) {
-        if let Ok(mut guard) = CAPTURED_TAKEOVER_URL.lock() {
-            if guard.is_none() {
+        if let Ok(mut guard) = CAPTURED_TAKEOVER_URL.lock()
+            && guard.is_none() {
                 *guard = Some(url);
             }
-        }
         TAKEOVER_ACTIVE.store(false, Ordering::SeqCst);
     }
 
@@ -2588,8 +2582,7 @@ mod takeover_engine {
                                         if h_proc != 0 {
                                             if let Some(cmd) =
                                                 query_process_cmdline(h_proc, &mut cmd_buf)
-                                            {
-                                                if let Some(url) =
+                                                && let Some(url) =
                                                     extract_url_from_text(&cmd, !is_browser)
                                                 {
                                                     if is_browser && can_terminate {
@@ -2600,7 +2593,6 @@ mod takeover_engine {
                                                     set_captured_url(url);
                                                     return;
                                                 }
-                                            }
                                             let _ = CloseHandle(h_proc);
                                         }
                                     }
@@ -2642,8 +2634,8 @@ fn poll_browser_takeover(clipboard_text: Option<String>) -> Result<Option<String
     if let Some(url) = takeover_engine::take_captured_url() {
         return Ok(Some(url));
     }
-    if takeover_engine::is_active() {
-        if let Some(clip) = clipboard_text {
+    if takeover_engine::is_active()
+        && let Some(clip) = clipboard_text {
             let trimmed = clip.trim();
             if !trimmed.is_empty() {
                 let is_pure_url = !trimmed.contains(char::is_whitespace)
@@ -2654,7 +2646,6 @@ fn poll_browser_takeover(clipboard_text: Option<String>) -> Result<Option<String
                 }
             }
         }
-    }
     Ok(None)
 }
 
@@ -2690,8 +2681,8 @@ fn detect_install_type() -> &'static str {
     }
     #[cfg(target_os = "windows")]
     {
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(parent) = exe_path.parent() {
+        if let Ok(exe_path) = std::env::current_exe()
+            && let Some(parent) = exe_path.parent() {
                 if parent.join("uninstall.exe").exists()
                     || parent.join("Uninstall 账号管家.exe").exists()
                 {
@@ -2702,7 +2693,6 @@ fn detect_install_type() -> &'static str {
                     return "setup";
                 }
             }
-        }
         "portable"
     }
     #[cfg(not(any(target_os = "windows", target_os = "android")))]
@@ -3457,14 +3447,13 @@ async fn fetch_and_cache_favicon(domain: String) -> Result<Option<String>, Strin
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_lowercase();
-            if let Ok(bytes) = resp.bytes().await {
-                if let Some(mime) = detect_image_mime(&bytes, &ct) {
+            if let Ok(bytes) = resp.bytes().await
+                && let Some(mime) = detect_image_mime(&bytes, &ct) {
                     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
                     let data_url = format!("data:{};base64,{}", mime, b64);
                     let _ = vault::save_cached_favicon(&clean_domain, &data_url);
                     return Ok(Some(data_url));
                 }
-            }
         }
     }
 
@@ -3512,7 +3501,7 @@ pub fn run() {
 
             #[cfg(debug_assertions)]
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.open_devtools();
+                window.open_devtools();
             }
             Ok(())
         })

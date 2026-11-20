@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use crate::models::AccountRecord;
 
+pub type UnlockedVault = (Vec<AccountRecord>, [u8; 32], [u8; 16]);
+
 pub const AAD: &[u8] = b"AccountVault:1";
 pub const RECORD_AAD: &[u8] = b"AccountVault:Record:1";
 pub const SETTING_AAD: &[u8] = b"AccountVault:Setting:1";
@@ -107,18 +109,12 @@ pub fn encrypt_records_with_key(
     serde_json::to_string_pretty(&envelope).map_err(|e| e.to_string())
 }
 
-pub fn decrypt_records(
-    blob: &str,
-    password: &str,
-) -> Result<(Vec<AccountRecord>, [u8; 32], [u8; 16]), String> {
+pub fn decrypt_records(blob: &str, password: &str) -> Result<UnlockedVault, String> {
     decrypt_records_with_aad(blob, password, AAD)
 }
 
 /// 兼容解密：优先尝试 AccountVault:1，若失败则尝试 GoogleAccountVault:1（用于导入 .gvault 迁移数据）
-pub fn decrypt_records_compat(
-    blob: &str,
-    password: &str,
-) -> Result<(Vec<AccountRecord>, [u8; 32], [u8; 16]), String> {
+pub fn decrypt_records_compat(blob: &str, password: &str) -> Result<UnlockedVault, String> {
     if let Ok(res) = decrypt_records_with_aad(blob, password, AAD) {
         return Ok(res);
     }
@@ -133,13 +129,11 @@ pub fn decrypt_records_compat(
         if r.username.trim().is_empty() && !r.email.trim().is_empty() {
             r.username = r.email.clone();
         }
-        if r.plan.trim().is_empty() {
-            if let Some(g_plan) = r.extra.get("google_one_plan") {
-                if !g_plan.trim().is_empty() && g_plan != "Free" {
+        if r.plan.trim().is_empty()
+            && let Some(g_plan) = r.extra.get("google_one_plan")
+                && !g_plan.trim().is_empty() && g_plan != "Free" {
                     r.plan = g_plan.clone();
                 }
-            }
-        }
     }
     Ok((records, key, salt))
 }
@@ -148,7 +142,7 @@ fn decrypt_records_with_aad(
     blob: &str,
     password: &str,
     aad: &[u8],
-) -> Result<(Vec<AccountRecord>, [u8; 32], [u8; 16]), String> {
+) -> Result<UnlockedVault, String> {
     let envelope: VaultEnvelope =
         serde_json::from_str(blob).map_err(|e| format!("解析保险库结构失败: {e}"))?;
     if envelope.version != 1 {
@@ -202,11 +196,10 @@ fn has_initialized_vault(path: &Path) -> bool {
     if !path.exists() {
         return false;
     }
-    if let Ok(conn) = Connection::open(path) {
-        if let Ok(Some(_)) = get_meta(&conn, "salt") {
+    if let Ok(conn) = Connection::open(path)
+        && let Ok(Some(_)) = get_meta(&conn, "salt") {
             return true;
         }
-    }
     false
 }
 
@@ -510,10 +503,7 @@ pub fn create_vault_db(password: &str) -> Result<([u8; 32], [u8; 16]), String> {
     create_vault_db_at(&vault_db_path(), password)
 }
 
-pub fn unlock_vault_db_at(
-    path: &Path,
-    password: &str,
-) -> Result<(Vec<AccountRecord>, [u8; 32], [u8; 16]), String> {
+pub fn unlock_vault_db_at(path: &Path, password: &str) -> Result<UnlockedVault, String> {
     let conn = open_connection(path)?;
     init_schema(&conn)?;
 
@@ -558,9 +548,7 @@ pub fn unlock_vault_db_at(
     Ok((records, key, salt))
 }
 
-pub fn unlock_vault_db(
-    password: &str,
-) -> Result<(Vec<AccountRecord>, [u8; 32], [u8; 16]), String> {
+pub fn unlock_vault_db(password: &str) -> Result<UnlockedVault, String> {
     let db_path = vault_db_path();
     if has_initialized_vault(&db_path) {
         return unlock_vault_db_at(&db_path, password);
@@ -627,7 +615,7 @@ pub fn replace_all_records_db_at(
     let tx = conn
         .transaction()
         .map_err(|e| format!("开启 SQLite 事务失败: {e}"))?;
-    write_verifier_meta(&conn_from_tx(&tx), key, salt)?;
+    write_verifier_meta(conn_from_tx(&tx), key, salt)?;
     tx.execute("DELETE FROM accounts", [])
         .map_err(|e| format!("清空旧账号表失败: {e}"))?;
     for r in records {
@@ -676,7 +664,7 @@ pub fn create_db_snapshot(keep_backups: usize, tag: Option<&str>) -> Result<Path
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
                 p.extension()
-                    .map_or(false, |ext| ext == "db" || ext == "avault")
+                    .is_some_and(|ext| ext == "db" || ext == "avault")
             })
             .collect();
         files.sort();

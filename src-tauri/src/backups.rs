@@ -23,9 +23,9 @@ pub fn list_backups() -> Result<Vec<BackupFileInfo>, String> {
         let path = entry.path();
         let is_backup = path
             .extension()
-            .map_or(false, |ext| ext == "db" || ext == "avault");
-        if is_backup {
-            if let Ok(metadata) = entry.metadata() {
+            .is_some_and(|ext| ext == "db" || ext == "avault");
+        if is_backup
+            && let Ok(metadata) = entry.metadata() {
                 let filename = path
                     .file_name()
                     .unwrap_or_default()
@@ -44,7 +44,6 @@ pub fn list_backups() -> Result<Vec<BackupFileInfo>, String> {
                     size_bytes: metadata.len(),
                 });
             }
-        }
     }
 
     result.sort_by(|a, b| b.filename.cmp(&a.filename));
@@ -73,7 +72,7 @@ pub fn restore_backup(filename: &str, master_password: &str) -> Result<Vec<Accou
         return Err(format!("备份文件不存在: {filename}"));
     }
 
-    let (records, key, salt) = if backup_path.extension().map_or(false, |ext| ext == "db") {
+    let (records, key, salt) = if backup_path.extension().is_some_and(|ext| ext == "db") {
         vault::unlock_vault_db_at(&backup_path, master_password)?
     } else {
         let blob = fs::read_to_string(&backup_path).map_err(|e| format!("读取备份失败: {e}"))?;

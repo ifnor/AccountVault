@@ -55,7 +55,7 @@ mod windows_impl {
     const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
 
     pub fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
-        let mut in_blob = DATA_BLOB {
+        let in_blob = DATA_BLOB {
             cb_data: data.len() as u32,
             pb_data: data.as_ptr() as *mut u8,
         };
@@ -66,7 +66,7 @@ mod windows_impl {
 
         let success = unsafe {
             CryptProtectData(
-                &mut in_blob,
+                &in_blob,
                 null_mut(),
                 null_mut(),
                 null_mut(),
@@ -94,7 +94,7 @@ mod windows_impl {
     }
 
     pub fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
-        let mut in_blob = DATA_BLOB {
+        let in_blob = DATA_BLOB {
             cb_data: data.len() as u32,
             pb_data: data.as_ptr() as *mut u8,
         };
@@ -105,7 +105,7 @@ mod windows_impl {
 
         let success = unsafe {
             CryptUnprotectData(
-                &mut in_blob,
+                &in_blob,
                 null_mut(),
                 null_mut(),
                 null_mut(),

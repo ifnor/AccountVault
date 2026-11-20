@@ -122,7 +122,9 @@
         resolve(ev.data.result);
       };
       window.addEventListener("message", onMsg);
-      window.postMessage({ type: "AV_WEBAUTHN_REQ", reqId, action, payload }, "*");
+      const targetOrigin =
+        window.location.origin && window.location.origin !== "null" ? window.location.origin : "*";
+      window.postMessage({ type: "AV_WEBAUTHN_REQ", reqId, action, payload }, targetOrigin);
       setTimeout(() => {
         window.removeEventListener("message", onMsg);
         resolve({ fallback: true });

@@ -83,6 +83,7 @@ async function clearPersistedSession() {
 }
 
 async function persistSessionEncrypted(sessObj) {
+  const { masterPassword: _omitted, ...safeSess } = sessObj || {};
   const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
   const jwk = await crypto.subtle.exportKey("jwk", key);
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -90,7 +91,7 @@ async function persistSessionEncrypted(sessObj) {
     await crypto.subtle.encrypt(
       { name: "AES-GCM", iv },
       key,
-      new TextEncoder().encode(JSON.stringify(sessObj))
+      new TextEncoder().encode(JSON.stringify(safeSess))
     )
   );
   await chrome.storage.local.set({
@@ -265,6 +266,31 @@ function registrableDomain(host) {
   return last2;
 }
 
+function isValidRpIdForHost(rpId, hostname) {
+  const rp = (rpId || "").trim().toLowerCase().replace(/\.+$/, "");
+  const host = (hostname || "").trim().toLowerCase().replace(/\.+$/, "");
+  if (!rp || !host) return false;
+  if (rp === host) return true;
+  if (!host.endsWith(`.${rp}`)) return false;
+  const parts = rp.split(".").filter(Boolean);
+  if (parts.length < 2) return false;
+  const multiTlds = new Set([
+    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "co.uk", "org.uk",
+    "co.jp", "ne.jp", "com.hk", "com.tw", "com.au", "co.kr"
+  ]);
+  return !multiTlds.has(rp);
+}
+
+function getSenderHostname(sender) {
+  const raw = sender?.url || sender?.tab?.url || "";
+  if (!raw) return "";
+  try {
+    return new URL(raw).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
 function hostsMatch(a, b) {
   if (!a || !b) return false;
   if (a === b || a.endsWith(`.${b}`) || b.endsWith(`.${a}`)) return true;
@@ -288,7 +314,8 @@ function domainMatches(rec, targetHost) {
       if (hostsMatch(domain, targetHost)) return true;
     }
   }
-  const baseLabel = targetHost.split(".")[0] || "";
+  const regDomain = registrableDomain(targetHost);
+  const baseLabel = regDomain.split(".")[0] || "";
   if (baseLabel.length >= 3 && titleLower.length >= 3) {
     if (titleLower.includes(baseLabel) || baseLabel.includes(titleLower)) return true;
   }
@@ -799,6 +826,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
 
     if (msg.type === "MATCH_PASSKEYS") {
+      const senderHost = getSenderHostname(sender);
+      if (senderHost && !isValidRpIdForHost(msg.rpId || senderHost, senderHost)) {
+        sendResponse({ ok: false, error: "rpId 与当前页面域名不匹配", items: [] });
+        return;
+      }
       if (cfg.mode === "webdav") {
         let sess = await getWebDavSession(cfg.idleMinutes);
         if (!sess) {
@@ -836,6 +868,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
 
     if (msg.type === "SAVE_PASSKEY") {
+      const senderHost = getSenderHostname(sender);
+      if (senderHost && !isValidRpIdForHost(msg.rpId || "", senderHost)) {
+        sendResponse({ ok: false, error: "rpId 与当前页面域名不匹配" });
+        return;
+      }
       if (cfg.mode === "webdav") {
         const sess = await getWebDavSession(cfg.idleMinutes);
         if (!sess) {

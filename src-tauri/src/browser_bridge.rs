@@ -128,9 +128,9 @@ fn config_file_path() -> PathBuf {
 }
 
 fn load_or_init_config() -> BrowserBridgeConfig {
-    if let Ok(Some(bytes)) = vault::load_encrypted_setting("browser_bridge_config") {
-        if let Ok(raw) = String::from_utf8(bytes) {
-            if let Ok(mut cfg) = serde_json::from_str::<BrowserBridgeConfig>(&raw) {
+    if let Ok(Some(bytes)) = vault::load_encrypted_setting("browser_bridge_config")
+        && let Ok(raw) = String::from_utf8(bytes)
+            && let Ok(mut cfg) = serde_json::from_str::<BrowserBridgeConfig>(&raw) {
                 if cfg.port == 0 {
                     cfg.port = DEFAULT_BRIDGE_PORT;
                 }
@@ -140,13 +140,11 @@ fn load_or_init_config() -> BrowserBridgeConfig {
                 }
                 return cfg;
             }
-        }
-    }
 
     // Auto-migrate legacy plaintext browser_bridge.json into encrypted SQLite3 app_settings
     let path = config_file_path();
-    if let Ok(raw) = std::fs::read_to_string(&path) {
-        if let Ok(mut cfg) = serde_json::from_str::<BrowserBridgeConfig>(&raw) {
+    if let Ok(raw) = std::fs::read_to_string(&path)
+        && let Ok(mut cfg) = serde_json::from_str::<BrowserBridgeConfig>(&raw) {
             if cfg.port == 0 {
                 cfg.port = DEFAULT_BRIDGE_PORT;
             }
@@ -157,7 +155,6 @@ fn load_or_init_config() -> BrowserBridgeConfig {
             let _ = std::fs::remove_file(&path);
             return cfg;
         }
-    }
     let cfg = BrowserBridgeConfig {
         enabled: true,
         port: DEFAULT_BRIDGE_PORT,
@@ -340,14 +337,14 @@ fn domain_matches(record: &AccountRecord, target_host: &str) -> bool {
             return true;
         }
     }
-    if let Some(known) = known_platform_domain(&record.title) {
-        if hosts_match(known, target_host) {
+    if let Some(known) = known_platform_domain(&record.title)
+        && hosts_match(known, target_host) {
             return true;
         }
-    }
     let title_lower = record.title.trim().to_lowercase();
     if title_lower.len() >= 3 {
-        let base_label = target_host.split('.').next().unwrap_or("");
+        let reg_domain = registrable_domain(target_host);
+        let base_label = reg_domain.split('.').next().unwrap_or("");
         if base_label.len() >= 3 && (title_lower.contains(base_label) || base_label.contains(&title_lower)) {
             return true;
         }
@@ -359,12 +356,11 @@ fn to_dto(rec: &AccountRecord) -> BridgeCredentialDto {
     let mut totp_code = String::new();
     let mut totp_remaining = 0u64;
     let has_totp = !rec.totp.trim().is_empty();
-    if has_totp {
-        if let Ok(res) = totp::calculate_totp(&rec.totp) {
+    if has_totp
+        && let Ok(res) = totp::calculate_totp(&rec.totp) {
             totp_code = res.code;
             totp_remaining = res.remaining_seconds;
         }
-    }
     let title = if !rec.title.trim().is_empty() {
         rec.title.trim().to_string()
     } else {
@@ -396,7 +392,7 @@ fn write_json_response(
         status,
         reason,
         allow_origin,
-        body.as_bytes().len(),
+        body.len(),
         body
     );
     let _ = stream.write_all(resp.as_bytes());
@@ -414,7 +410,7 @@ fn handle_connection(mut stream: TcpStream, app: &AppHandle) {
     if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
         return;
     }
-    let parts: Vec<&str> = request_line.trim_end().split_whitespace().collect();
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         return;
     }
@@ -425,6 +421,7 @@ fn handle_connection(mut stream: TcpStream, app: &AppHandle) {
         None => (full_path, ""),
     };
 
+    const MAX_BODY_BYTES: usize = 1024 * 1024;
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut content_length: usize = 0;
     loop {
@@ -440,7 +437,7 @@ fn handle_connection(mut stream: TcpStream, app: &AppHandle) {
             let key_lower = k.trim().to_lowercase();
             let val = v.trim().to_string();
             if key_lower == "content-length" {
-                content_length = val.parse::<usize>().unwrap_or(0).min(1024 * 1024);
+                content_length = val.parse::<usize>().unwrap_or(0);
             }
             headers.insert(key_lower, val);
         }
@@ -464,6 +461,17 @@ fn handle_connection(mut stream: TcpStream, app: &AppHandle) {
 
     if method == "OPTIONS" {
         write_json_response(&mut stream, 204, "No Content", cors_origin, "");
+        return;
+    }
+
+    if content_length > MAX_BODY_BYTES {
+        write_json_response(
+            &mut stream,
+            413,
+            "Payload Too Large",
+            cors_origin,
+            r#"{"error":"Request body too large"}"#,
+        );
         return;
     }
 
@@ -886,13 +894,12 @@ fn url_decode(s: &str) -> String {
             out.push(b' ');
             i += 1;
         } else if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
-                if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3])
+                && let Ok(val) = u8::from_str_radix(hex_str, 16) {
                     out.push(val);
                     i += 3;
                     continue;
                 }
-            }
             out.push(bytes[i]);
             i += 1;
         } else {

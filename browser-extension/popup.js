@@ -268,6 +268,17 @@ modeWebDavBtn.onclick = () => setModeUI("webdav");
 styleWindowBtn.onclick = () => setPromptStyleUI("window");
 styleOverlayBtn.onclick = () => setPromptStyleUI("overlay");
 
+function isInsecureRemoteHttp(rawUrl) {
+  const trimmed = (rawUrl || "").trim().toLowerCase();
+  if (!trimmed.startsWith("http://")) return false;
+  try {
+    const host = new URL(trimmed).hostname;
+    return host !== "localhost" && host !== "127.0.0.1" && host !== "::1";
+  } catch {
+    return true;
+  }
+}
+
 testDavBtn.onclick = async () => {
   davTestMsg.textContent = "正在测试连接...";
   davTestMsg.className = "hint-msg";
@@ -283,8 +294,13 @@ testDavBtn.onclick = async () => {
     webdavUser: davUserInput.value,
     webdavPass: davPassInput.value
   });
-  davTestMsg.textContent = res.ok ? res.message : res.error;
-  davTestMsg.className = res.ok ? "hint-msg ok" : "hint-msg err";
+  if (res.ok && isInsecureRemoteHttp(davUrlInput.value)) {
+    davTestMsg.textContent = `${res.message}（警告：非本机 HTTP 明文传输 Basic 凭证，建议改用 HTTPS）`;
+    davTestMsg.className = "hint-msg warn";
+  } else {
+    davTestMsg.textContent = res.ok ? res.message : res.error;
+    davTestMsg.className = res.ok ? "hint-msg ok" : "hint-msg err";
+  }
 };
 
 saveConfigBtn.onclick = async () => {

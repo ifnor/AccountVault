@@ -626,18 +626,32 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: #0f172a;
     `;
-    banner.innerHTML = `
-      <div style="font-size:13px;font-weight:700;margin-bottom:4px;">保存到 AccountVault？</div>
-      <div style="font-size:12px;color:#475569;margin-bottom:10px;word-break:break-all;">${location.hostname} · ${account.replace(/[<>&]/g, "")}</div>
-      <div style="display:flex;gap:8px;justify-content:flex-end;">
-        <button id="av-save-no" style="padding:5px 10px;border-radius:6px;border:1px solid #cbd5e1;background:#fff;cursor:pointer;font-size:12px;">暂不</button>
-        <button id="av-save-yes" style="padding:5px 12px;border-radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer;font-size:12px;font-weight:600;">保存</button>
-      </div>
-    `;
+    banner.innerHTML = "";
+    const titleEl = document.createElement("div");
+    titleEl.style.cssText = "font-size:13px;font-weight:700;margin-bottom:4px;";
+    titleEl.textContent = "保存到 AccountVault？";
+    const infoEl = document.createElement("div");
+    infoEl.style.cssText = "font-size:12px;color:#475569;margin-bottom:10px;word-break:break-all;";
+    infoEl.textContent = `${location.hostname} · ${account}`;
+    const btnRow = document.createElement("div");
+    btnRow.style.cssText = "display:flex;gap:8px;justify-content:flex-end;";
+    const noBtn = document.createElement("button");
+    noBtn.id = "av-save-no";
+    noBtn.style.cssText = "padding:5px 10px;border-radius:6px;border:1px solid #cbd5e1;background:#fff;cursor:pointer;font-size:12px;";
+    noBtn.textContent = "暂不";
+    const yesBtn = document.createElement("button");
+    yesBtn.id = "av-save-yes";
+    yesBtn.style.cssText = "padding:5px 12px;border-radius:6px;border:none;background:#2563eb;color:#fff;cursor:pointer;font-size:12px;font-weight:600;";
+    yesBtn.textContent = "保存";
+    btnRow.appendChild(noBtn);
+    btnRow.appendChild(yesBtn);
+    banner.appendChild(titleEl);
+    banner.appendChild(infoEl);
+    banner.appendChild(btnRow);
     document.body.appendChild(banner);
 
-    banner.querySelector("#av-save-no").onclick = () => banner.remove();
-    banner.querySelector("#av-save-yes").onclick = () => {
+    noBtn.onclick = () => banner.remove();
+    yesBtn.onclick = () => {
       chrome.runtime.sendMessage(
         {
           type: "SAVE_CREDENTIAL",
@@ -904,12 +918,37 @@
     });
   }
 
+  function isValidRpIdForHost(rpId, hostname) {
+    const rp = (rpId || "").trim().toLowerCase().replace(/\.+$/, "");
+    const host = (hostname || "").trim().toLowerCase().replace(/\.+$/, "");
+    if (!rp || !host) return false;
+    if (rp === host) return true;
+    if (!host.endsWith(`.${rp}`)) return false;
+    const parts = rp.split(".").filter(Boolean);
+    if (parts.length < 2) return false;
+    const multiTlds = new Set([
+      "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "co.uk", "org.uk",
+      "co.jp", "ne.jp", "com.hk", "com.tw", "com.au", "co.kr"
+    ]);
+    return !multiTlds.has(rp);
+  }
+
   window.addEventListener("message", (ev) => {
     if (ev.source !== window || !ev.data || ev.data.type !== "AV_WEBAUTHN_REQ") return;
     const { reqId, action, payload } = ev.data;
+    const targetOrigin =
+      window.location.origin && window.location.origin !== "null" ? window.location.origin : "*";
     const reply = (result) => {
-      window.postMessage({ type: "AV_WEBAUTHN_RESP", reqId, result }, "*");
+      window.postMessage({ type: "AV_WEBAUTHN_RESP", reqId, result }, targetOrigin);
     };
+
+    if (action === "CREATE_PROMPT" || action === "SAVE_PASSKEY" || action === "GET_PASSKEY") {
+      const reqRpId = (payload?.rpId || location.hostname || "").trim();
+      if (!isValidRpIdForHost(reqRpId, location.hostname)) {
+        reply({ fallback: true, error: "Invalid rpId for origin" });
+        return;
+      }
+    }
 
     if (action === "CREATE_PROMPT") {
       chrome.runtime.sendMessage({ type: "GET_STATUS" }, async (st) => {
