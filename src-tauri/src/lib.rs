@@ -16,7 +16,10 @@ pub mod webdav;
 use android_autofill::{consume_android_pending_saves, sync_android_autofill_records};
 use models::{AccountRecord, TotpQrResult, TotpResult};
 use parking_lot::RwLock;
-use tauri::{Manager, State};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{Emitter, Manager, State};
+
+static CLOSE_TO_TRAY: AtomicBool = AtomicBool::new(true);
 
 pub struct AppState {
     pub master_password: RwLock<Option<String>>,
@@ -823,6 +826,11 @@ fn increment_hotp_counter(
 }
 
 
+#[tauri::command]
+fn set_close_to_tray(enabled: bool) {
+    CLOSE_TO_TRAY.store(enabled, Ordering::Relaxed);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = AppState {
@@ -862,11 +870,76 @@ pub fn run() {
             #[cfg(not(target_os = "android"))]
             browser_bridge::start_bridge_server(app.handle().clone());
 
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+                let show_item = MenuItem::with_id(app, "show", "打开账号管家", true, None::<&str>)?;
+                let lock_item = MenuItem::with_id(app, "lock", "立即锁定保险库", true, None::<&str>)?;
+                let quit_item = MenuItem::with_id(app, "quit", "退出账号管家", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&show_item, &lock_item, &quit_item])?;
+
+                let mut tray_builder = TrayIconBuilder::with_id("main-tray")
+                    .menu(&menu)
+                    .tooltip("账号管家 (Account Vault)")
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "show" => {
+                            if let Some(win) = app.get_webview_window("main") {
+                                let _ = win.unminimize();
+                                let _ = win.show();
+                                let _ = win.set_focus();
+                            }
+                        }
+                        "lock" => {
+                            let st = app.state::<AppState>();
+                            *st.master_password.write() = None;
+                            *st.vault_key.write() = None;
+                            st.records.write().clear();
+                            let _ = app.emit("vault-locked-from-tray", ());
+                        }
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                            && let Some(win) = tray.app_handle().get_webview_window("main")
+                        {
+                            let _ = win.unminimize();
+                            let _ = win.show();
+                            let _ = win.set_focus();
+                        }
+                    });
+
+                if let Some(icon) = app.default_window_icon().cloned() {
+                    tray_builder = tray_builder.icon(icon);
+                }
+                let _ = tray_builder.build(app)?;
+            }
+
             #[cfg(debug_assertions)]
             if let Some(window) = app.get_webview_window("main") {
                 window.open_devtools();
             }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if window.label() == "main"
+                && let tauri::WindowEvent::CloseRequested { api, .. } = event
+                && CLOSE_TO_TRAY.load(Ordering::Relaxed)
+            {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            let _ = (window, event);
         })
         .invoke_handler(tauri::generate_handler![
             check_vault_exists,
@@ -916,7 +989,8 @@ pub fn run() {
             android_autofill::open_android_autofill_settings,
             favicon::get_cached_favicons,
             favicon::fetch_and_cache_favicon,
-            increment_hotp_counter
+            increment_hotp_counter,
+            set_close_to_tray
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

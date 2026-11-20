@@ -34,6 +34,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39.1"
 windows = { version = "0.62", features = [

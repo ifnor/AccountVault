@@ -27,6 +27,7 @@ defineProps<{
   clipboardClearSeconds: number;
   androidAutofillEnabled: boolean;
   browserBridgeStatus: { enabled: boolean; port: number; token: string; running: boolean };
+  closeToTray: boolean;
   webdavForm: { url: string; username: string; password: string; auto_sync: boolean };
   webdavStatus: string;
   isWebDavSyncing: boolean;
@@ -61,6 +62,7 @@ const emit = defineEmits<{
   (e: "open-android-autofill"): void;
   (e: "refresh-bridge"): void;
   (e: "toggle-bridge"): void;
+  (e: "toggle-close-to-tray"): void;
   (e: "copy-bridge-token"): void;
   (e: "regenerate-bridge-token"): void;
   (e: "save-webdav", showToast: boolean): void;
@@ -288,6 +290,15 @@ const emit = defineEmits<{
                   重置
                 </button>
               </div>
+            </div>
+            <div class="pt-3 border-t border-[#dadce0]/60 flex items-center justify-between gap-3">
+              <div>
+                <h4 class="text-xs font-bold text-[#202124]">关闭主窗口时最小化到系统托盘</h4>
+                <p class="text-[11px] text-[#5f6368] mt-0.5">关闭窗口后保持托盘驻留与浏览器扩展桥接在线，可在托盘右键菜单彻底退出。</p>
+              </div>
+              <button type="button" @click="emit('toggle-close-to-tray')" :class="['relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors', closeToTray ? 'bg-[#1a73e8]' : 'bg-[#dadce0]']">
+                <span :class="['inline-block h-5 w-5 transform rounded-full bg-white shadow transition', closeToTray ? 'translate-x-5' : 'translate-x-0']" />
+              </button>
             </div>
           </div>
         </div>

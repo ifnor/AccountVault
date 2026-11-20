@@ -553,8 +553,28 @@ const {
 // ==================== SETTINGS, BRIDGE & AUTOFILL ====================
 const showSettingsModal = ref(false);
 const settingsTab = ref<"security" | "webdav" | "backups" | "updates" | "about">("security");
+const closeToTray = ref(localStorage.getItem("avault_close_to_tray") !== "false");
+
+async function toggleCloseToTray() {
+  closeToTray.value = !closeToTray.value;
+  try {
+    localStorage.setItem("avault_close_to_tray", String(closeToTray.value));
+  } catch (_) {}
+  try {
+    await invoke("set_close_to_tray", { enabled: closeToTray.value });
+  } catch (_) {}
+  notify(
+    closeToTray.value
+      ? "已开启：关闭窗口时最小化到系统托盘（扩展桥接保持在线）"
+      : "已关闭：点击关闭按钮将直接退出账号管家",
+    "info",
+    2500
+  );
+}
+
 let unlistenUpdateProgress: UnlistenFn | null = null;
 let unlistenRecordsUpdated: UnlistenFn | null = null;
+let unlistenTrayLock: UnlistenFn | null = null;
 
 const {
   androidAutofillEnabled,
@@ -659,6 +679,21 @@ onMounted(async () => {
   }
   await refreshSecurityStatus();
   await refreshAutofillAndBridgeStatus();
+  try {
+    await invoke("set_close_to_tray", { enabled: closeToTray.value });
+  } catch (_) {}
+  try {
+    unlistenTrayLock = await listen("vault-locked-from-tray", () => {
+      if (isUnlocked.value) {
+        isUnlocked.value = false;
+        masterPassword.value = "";
+        records.value = [];
+        selectedId.value = null;
+        totpMap.value = {};
+        if (totpTimer) clearInterval(totpTimer);
+      }
+    });
+  } catch (_) {}
   await loadCachedFavicons();
   await setupBackNavigation();
   try {
@@ -737,6 +772,9 @@ onUnmounted(() => {
   }
   if (unlistenRecordsUpdated) {
     unlistenRecordsUpdated();
+  }
+  if (unlistenTrayLock) {
+    unlistenTrayLock();
   }
 });
 </script>
@@ -959,6 +997,7 @@ onUnmounted(() => {
       :clipboard-clear-seconds="clipboardClearSeconds"
       :android-autofill-enabled="androidAutofillEnabled"
       :browser-bridge-status="browserBridgeStatus"
+      :close-to-tray="closeToTray"
       :webdav-form="webdavForm"
       :webdav-status="webdavStatus"
       :is-web-dav-syncing="isWebDavSyncing"
@@ -988,6 +1027,7 @@ onUnmounted(() => {
       @open-android-autofill="openAndroidAutofillSettings"
       @refresh-bridge="refreshAutofillAndBridgeStatus"
       @toggle-bridge="toggleBrowserBridge"
+      @toggle-close-to-tray="toggleCloseToTray"
       @copy-bridge-token="copyBrowserBridgeToken"
       @regenerate-bridge-token="regenerateBrowserBridgeToken"
       @save-webdav="handleSaveWebDavConfig"
